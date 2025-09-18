@@ -8,6 +8,11 @@ conda create --name RiemannianRF python=3.11
 pip install -r requirements.txt
 ```
 
+Or
+```
+conda env create -f environment.yml
+```
+
 ## Download Datasets
 ```angular2html
 python scripts/download_coco17.py
@@ -20,19 +25,33 @@ huggingface-cli login
 ```
 
 ## Fine-Tuning
-
+Stable Diffusion v3.5
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_base.env' CONFIG_JSON_FILE='config/config_coco17_lognorm.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train.sh
-CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG_JSON_FILE='config/config_coco17_sd35_rcfm.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_rcfm.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_base.env' CONFIG_JSON_FILE='config/config_coco17_sd35_rcfm.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_rcfm.sh
 CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG_JSON_FILE='config/config_coco17_sd35_proposed.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed.sh
-CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_base.env' CONFIG_JSON_FILE='config/config_coco17_flux.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train.sh
 ```
 
-## Inference
+Flux.1.dev
+
 ```bash
-CUDA_VISIBLE_DEVICES=0 bash ./inference.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_base.env' CONFIG_JSON_FILE='config/config_coco17_flux.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_base.env' CONFIG_JSON_FILE='config/config_coco17_flux_rcfm.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_rcfm.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG_JSON_FILE='config/config_coco17_flux_proposed.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed.sh
+```
+
+
+## Inference
+Inference on MS COCO17
+```bash
 CUDA_VISIBLE_DEVICES=0 bash ./inference_coco17.sh
 CUDA_VISIBLE_DEVICES=0 bash inference_flux_coco17.sh
+```
+
+Inference on MS COCO17
+```bash
+CUDA_VISIBLE_DEVICES=0 bash ./inference_coco14.sh
+CUDA_VISIBLE_DEVICES=0 bash inference_flux_coco14.sh
 ```
 
 ## Evaluation on Image Quality and Image-Text Alignment

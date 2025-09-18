@@ -18,7 +18,7 @@
     "--model_family": "sd3",
     "--pretrained_model_name_or_path": "stabilityai/stable-diffusion-3.5-large",
     "--output_dir": "output/coco17_proposed_GeodesicFlow_lambda0.0001",
-    "--geodesicflow_metric_reg": 0.0001,
+    "--geodesicflow_metric_reg_lambda": 0.0001,
     "--curveflow_lambda": 0.1,
     "--curveflow_m_grid_size": 10000,
     "--tsaw_delta": 0.0001,
