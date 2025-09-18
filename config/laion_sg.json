@@ -1,0 +1,30 @@
+[
+    {
+    "id": "laionsg",
+    "type": "local",
+    "crop": false,
+    "crop_aspect": "square",
+    "crop_style": "center",
+    "resolution": 512,
+    "minimum_image_size": 512,
+    "maximum_image_size": 512,
+    "target_downsample_size": 512,
+    "resolution_type": "pixel",
+    "cache_dir_vae": "cache/vae/sd3_ft/laion_sg",
+    "instance_data_dir": "/path/to/datasets/laion_sg/train",
+    "disabled": false,
+    "skip_file_discovery": "",
+    "caption_strategy": "textfile",
+    "metadata_backend": "json",
+    "repeats": 1
+    },
+    {
+    "id": "laion_sg_text",
+    "type": "local",
+    "dataset_type": "text_embeds",
+    "default": true,
+    "cache_dir": "cache/text/sd3_ft/laion_sg",
+    "disabled": false,
+    "write_batch_size": 128
+    }
+]
