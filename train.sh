@@ -7,8 +7,15 @@
 #export ENV=''
 
 #export CONFIG_JSON_FILE='config/config_tsaw0.005.json'
-
-source activate base
+if [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+have_conda=true
+elif [[ -f "/opt/conda/etc/profile.d/conda.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "/opt/conda/etc/profile.d/conda.sh"
+    have_conda=true
+fi
 conda activate RiemannianRF
 
 export TMPDIR="/tmp"
@@ -23,13 +30,20 @@ fi
 # [ -f "config/config.env" ] && source config/config.env
 
 # If the user has not provided VENV_PATH, we will assume $(pwd)/.venv
-if [ -z "${VENV_PATH}" ]; then
-    # what if we have VIRTUAL_ENV? use that instead
-    if [ -n "${VIRTUAL_ENV}" ]; then
-        export VENV_PATH="${VIRTUAL_ENV}"
-    else
-        export VENV_PATH="$(pwd)/.venv"
-    fi
+# If no conda env active, try Python virtualenv
+if [[ "${activated_env}" == "none" ]]; then
+  if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    VENV_PATH="${VIRTUAL_ENV}"
+  else
+    VENV_PATH="${VENV_PATH:-"$(pwd)/.venv"}"
+  fi
+  if [[ -d "${VENV_PATH}" && -f "${VENV_PATH}/bin/activate" ]]; then
+    # shellcheck source=/dev/null
+    source "${VENV_PATH}/bin/activate"
+    activated_env="venv:${VENV_PATH}"
+  else
+    echo "⚠️  No venv at '${VENV_PATH}'. Proceeding without Python env activation."
+  fi
 fi
 if [ -z "${DISABLE_LD_OVERRIDE}" ]; then
     export NVJITLINK_PATH="$(find "${VENV_PATH}" -name nvjitlink -type d)/lib"
