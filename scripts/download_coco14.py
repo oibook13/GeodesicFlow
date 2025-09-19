@@ -8,7 +8,7 @@ from datasets import load_dataset
 
 # Define the dataset name and the local directory to save the files
 dataset_name = "UCSC-VLAA/Recap-COCO-30K"
-local_dir = "/PHShome/yl535/project/python/datasets/coco14"
+local_dir = "/opt/dlami/nvme/datasets/coco14"
 
 # Load the dataset from Hugging Face
 dataset = load_dataset(dataset_name)

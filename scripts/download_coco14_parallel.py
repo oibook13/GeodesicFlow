@@ -10,13 +10,18 @@ from urllib3.util.retry import Retry
 from datasets import load_dataset
 from tqdm import tqdm
 
-# --- NEW: image mode check ---
-from PIL import Image, ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True  # tolerate slightly truncated files
+# Optional: enable to delete non-RGB images (very rare)
+enforce_rgb_non_rgb_delete = False
+try:
+    from PIL import Image, ImageFile
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+except ImportError:
+    Image = None
+    enforce_rgb_non_rgb_delete = False  # can't enforce without Pillow
 
 # --------- Config ----------
-dataset_name = "phiyodr/coco2017"
-local_dir = "/opt/dlami/nvme/datasets/coco17"
+dataset_name = "UCSC-VLAA/Recap-COCO-30K"
+local_dir = "/opt/dlami/nvme/datasets/coco14"
 max_workers = 64          # tune for your bandwidth / host
 connect_timeout = 10
 read_timeout = 60
@@ -26,8 +31,8 @@ retries = 3               # automatic retry on transient errors
 # Make dirs
 Path(local_dir).mkdir(parents=True, exist_ok=True)
 
-# Load dataset
-dataset = load_dataset(dataset_name)  # keys usually: 'train', 'validation' (and maybe 'test')
+# Load dataset (splits usually: 'train', maybe 'validation' or others for this repo)
+dataset = load_dataset(dataset_name)
 
 # Session with retries (shared across threads)
 def make_session() -> requests.Session:
@@ -46,10 +51,10 @@ def make_session() -> requests.Session:
 
 SESSION = make_session()
 
-def safe_download(url: str, dest: Path) -> None:
-    """Download to dest via temp file + atomic rename. Skips if exists."""
+def safe_download(url: str, dest: Path) -> bool:
+    """Download to dest via temp file + atomic rename. Returns True if file exists at end."""
     if dest.exists():
-        return
+        return True
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
         with SESSION.get(url, stream=True, timeout=(connect_timeout, read_timeout)) as r:
@@ -58,71 +63,93 @@ def safe_download(url: str, dest: Path) -> None:
             with open(tmp, "wb") as f:
                 shutil.copyfileobj(r.raw, f)
         tmp.replace(dest)  # atomic on same filesystem
+        return True
     except requests.exceptions.TooManyRedirects:
         tqdm.write(f"[skip] Too many redirects: {url}")
-        if tmp.exists():
-            tmp.unlink(missing_ok=True)
     except Exception as e:
         tqdm.write(f"[error] {url} -> {e}")
+    finally:
         if tmp.exists():
-            tmp.unlink(missing_ok=True)
-        # Don't re-raise; we just log and continue
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+    return dest.exists()
 
 def is_rgb_image(path: Path) -> bool:
     """Return True if image opens successfully and is exactly mode 'RGB'."""
+    if not enforce_rgb_non_rgb_delete or Image is None:
+        return True  # treat as OK if not enforcing
     try:
         with Image.open(path) as im:
-            im.load()  # force decode
+            im.load()
             return im.mode == "RGB"
     except Exception as e:
         tqdm.write(f"[img open error] {path}: {e}")
-        return False  # treat unreadable as not-RGB/bad
+        return False
+
+def extract_base_from_url(img_url: str) -> str:
+    """
+    From a COCO URL like .../train2014/COCO_train2014_000000522418.jpg
+    or .../train2017/000000522418.jpg → return '000000522418'
+    """
+    fname = os.path.basename(img_url)
+    stem, _ = os.path.splitext(fname)
+    # Handle prefixes like 'COCO_train2014_000000522418' → keep the last 12 digits if present
+    # Otherwise just return the stem.
+    tail_digits = ''.join(ch for ch in stem if ch.isdigit())
+    if len(tail_digits) >= 12:
+        return tail_digits[-12:]
+    return stem
 
 def process_one(split_dir: Path, item: dict) -> str:
     """
-    Download image and write JSON, deleting any non-RGB images.
-    Returns 'downloaded', 'skipped', 'non_rgb_deleted', or 'error' (logged).
+    Download image and write caption .txt (and delete non-RGB if enabled).
+    Returns one of: 'downloaded', 'skipped', 'non_rgb_deleted', or 'error'.
     """
-    # file_name looks like "train2017/000000522418.jpg" → want "000000522418"
-    base = os.path.splitext(os.path.basename(item["file_name"]))[0]
-    img_url = item.get("coco_url")
+    img_url = item.get("coco_url") or item.get("image_url")
     if not img_url:
         return "error"
 
+    base = extract_base_from_url(img_url)
     img_path = split_dir / f"{base}.jpg"
-    json_path = split_dir / f"{base}.json"
+    txt_path = split_dir / f"{base}.txt"
 
-    # If image already exists, ensure JSON exists; we'll still verify RGB below
-    if img_path.exists() and not json_path.exists():
-        try:
-            with open(json_path, "w") as jf:
-                json.dump(item, jf)
-        except Exception as e:
-            tqdm.write(f"[json error] {json_path}: {e}")
-            return "error"
+    # If image exists, ensure caption exists; still verify RGB if enabled
+    if img_path.exists():
+        if enforce_rgb_non_rgb_delete and not is_rgb_image(img_path):
+            img_path.unlink(missing_ok=True)
+            txt_path.unlink(missing_ok=True)
+            return "non_rgb_deleted"
+        if not txt_path.exists():
+            try:
+                with open(txt_path, "w") as tf:
+                    tf.write(str(item.get("caption", "")))
+            except Exception as e:
+                tqdm.write(f"[txt error] {txt_path}: {e}")
+                return "error"
+        return "skipped"
 
-    # Download if missing
-    if not img_path.exists():
-        safe_download(img_url, img_path)
-        if not img_path.exists():
-            return "error"
-
-    # Check color mode; delete non-RGB (and its JSON to keep dataset clean)
-    if not is_rgb_image(img_path):
-        img_path.unlink(missing_ok=True)
-        json_path.unlink(missing_ok=True)
-        return "non_rgb_deleted"
-
-    # Save/overwrite JSON (best-effort)
-    try:
-        with open(json_path, "w") as jf:
-            json.dump(item, jf)
-    except Exception as e:
-        tqdm.write(f"[json error] {json_path}: {e}")
+    # Download image
+    ok = safe_download(img_url, img_path)
+    if not ok:
         return "error"
 
-    # If we reached here and the file existed before, call it 'skipped'
-    return "skipped" if "downloaded" not in locals() and not (json_path.stat().st_size == 0) else "downloaded"
+    # Optionally delete non-RGB
+    if enforce_rgb_non_rgb_delete and not is_rgb_image(img_path):
+        img_path.unlink(missing_ok=True)
+        txt_path.unlink(missing_ok=True)
+        return "non_rgb_deleted"
+
+    # Write caption .txt (best-effort; only if image exists)
+    try:
+        with open(txt_path, "w") as tf:
+            tf.write(str(item.get("caption", "")))
+    except Exception as e:
+        tqdm.write(f"[txt error] {txt_path}: {e}")
+        return "error"
+
+    return "downloaded"
 
 def run_split(split_name: str):
     split_dir = Path(local_dir) / split_name
@@ -130,7 +157,6 @@ def run_split(split_name: str):
     ds_split = dataset[split_name]
     total = len(ds_split)
 
-    # Use a thread pool and submit per item
     results = {"downloaded": 0, "skipped": 0, "non_rgb_deleted": 0, "error": 0}
     with ThreadPoolExecutor(max_workers=max_workers) as ex, tqdm(total=total, desc=f"{split_name}", unit="img") as pbar:
         futures = (ex.submit(process_one, split_dir, ds_split[i]) for i in range(total))
@@ -138,7 +164,6 @@ def run_split(split_name: str):
             status = fut.result()
             results[status] = results.get(status, 0) + 1
             pbar.update(1)
-            # Optional: show occasional stats
             if (pbar.n % 1000) == 0:
                 pbar.set_postfix(results)
     tqdm.write(f"[{split_name}] {results}")
