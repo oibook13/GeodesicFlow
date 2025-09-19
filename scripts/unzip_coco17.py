@@ -1,50 +1,156 @@
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tqdm import tqdm
+import shutil
 
-# --- paths ---
-zip_path = Path("/opt/dlami/nvme/datasets/coco17_only_txt.zip")
-root_dir = Path("/opt/dlami/nvme/datasets/coco17")
+ROOT = Path("/opt/dlami/nvme/datasets/coco17")
+ZIP_PATH = ROOT / "coco17_only_txt.zip"
 
-# make sure target dir exists
-root_dir.mkdir(parents=True, exist_ok=True)
+# Normalize any of these to canonical split names
+ALIASES = {
+    "train": "train", "train2014": "train", "train2017": "train",
+    "validation": "validation", "val": "validation", "val2014": "validation", "val2017": "validation",
+    "test": "test", "test2014": "test", "test2017": "test",
+}
 
-# 1) Extract ONLY .txt files from the zip, flattened into root_dir
-extracted_txt = 0
-with zipfile.ZipFile(zip_path, "r") as zf:
-    members = [m for m in zf.namelist() if m.lower().endswith(".txt")]
-    for m in tqdm(members, desc="extract txt", unit="file"):
-        # flatten: drop internal zip folders, keep just the filename
-        target = root_dir / Path(m).name
-        # if the file already exists, skip overwrite (idempotent)
-        if target.exists():
-            continue
-        with zf.open(m) as src, open(target, "wb") as dst:
-            dst.write(src.read())
-        extracted_txt += 1
+# Prepare dirs
+ROOT.mkdir(parents=True, exist_ok=True)
+for s in ("train", "validation", "test", "_staging_txt"):
+    (ROOT / s).mkdir(parents=True, exist_ok=True)
 
-# 2) Delete image files that don't share a prefix with ANY existing .jpg
-#    i.e., if basename (without ext) is not present among JPG files, remove it.
-IMAGE_EXTS = {".png", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".heic", ".heif"}
-jpg_stems = set()
+def detect_split_from_parts(parts):
+    """
+    Look through *all* path parts inside the zip for a known split alias.
+    Return canonical split ('train'/'validation'/'test') or None.
+    """
+    for part in parts:
+        key = part.lower()
+        if key in ALIASES:
+            return ALIASES[key]
+    return None
 
-# collect all .jpg basenames recursively
-for p in root_dir.rglob("*.jpg"):
-    jpg_stems.add(p.stem)
+def safe_write_bytes(target: Path, src_fileobj):
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp, "wb") as dst:
+        shutil.copyfileobj(src_fileobj, dst)
+    tmp.replace(target)
 
-deleted_images = 0
-kept_images = 0
+def extract_txts():
+    extracted = {"train": 0, "validation": 0, "test": 0, "staged": 0, "skipped": 0}
+    with zipfile.ZipFile(ZIP_PATH, "r") as zf:
+        members = [m for m in zf.namelist() if m.lower().endswith(".txt")]
+        for m in tqdm(members, desc="extract txt", unit="file"):
+            p = PurePosixPath(m)  # zip paths are POSIX-like
+            if m.endswith("/"):
+                continue  # skip directories just in case
 
-# scan for non-jpg images and remove those whose stem is not in jpg_stems
-for ext in IMAGE_EXTS:
-    for p in root_dir.rglob(f"*{ext}"):
-        if p.stem not in jpg_stems:
-            try:
-                p.unlink()
-                deleted_images += 1
-            except Exception as e:
-                print(f"[warn] failed to delete {p}: {e}")
+            split = detect_split_from_parts(p.parts)
+            # Flatten (drop internal subfolders), keep only filename
+            target_dir = ROOT / (split if split else "_staging_txt")
+            target = target_dir / p.name
+
+            if target.exists():
+                extracted["skipped"] += 1
+                continue
+
+            with zf.open(m) as src:
+                safe_write_bytes(target, src)
+            if split:
+                extracted[split] += 1
+            else:
+                extracted["staged"] += 1
+    return extracted
+
+def build_jpg_indexes():
+    """Return dict: split -> {stem set} and also a global stem->split map for resolving staged files."""
+    jpg_index = {}
+    stem_to_split = {}
+    for split in ("train", "validation", "test"):
+        split_dir = ROOT / split
+        stems = {p.stem for p in split_dir.rglob("*.jpg")}
+        jpg_index[split] = stems
+        for s in stems:
+            # If a stem appears in multiple splits (rare), prefer train > validation > test
+            if s not in stem_to_split or split == "train" or (stem_to_split[s] == "test" and split == "validation"):
+                stem_to_split[s] = split
+    return jpg_index, stem_to_split
+
+def place_staged_txt(jpg_index, stem_to_split):
+    """Move _staging_txt captions next to their JPG split; delete if no matching JPG anywhere."""
+    staged_dir = ROOT / "_staging_txt"
+    moved, deleted = 0, 0
+    for txt in staged_dir.glob("*.txt"):
+        stem = txt.stem
+        split = stem_to_split.get(stem)
+        if split:
+            dest = (ROOT / split / f"{stem}.txt")
+            if dest.exists():
+                # already have one; treat staged as duplicate
+                txt.unlink(missing_ok=True)
+                deleted += 1
+            else:
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(txt), str(dest))
+                    moved += 1
+                except Exception:
+                    try:
+                        shutil.copy2(str(txt), str(dest))
+                        txt.unlink(missing_ok=True)
+                        moved += 1
+                    except Exception as e:
+                        print(f"[warn] failed to place {txt} -> {dest}: {e}")
         else:
-            kept_images += 1
+            # no JPG anywhere -> remove
+            txt.unlink(missing_ok=True)
+            deleted += 1
+    return moved, deleted
 
-print(f"Done.\n  Extracted txt files: {extracted_txt}\n  Deleted non-matching images: {deleted_images}\n  Kept non-jpg images (matched a .jpg): {kept_images}")
+def enforce_per_split(split, jpg_stems):
+    """
+    In split dir:
+      - keep at most one .txt per JPG basename
+      - delete any .txt with no matching .jpg
+    """
+    split_dir = ROOT / split
+    kept = 0
+    del_unmatched = 0
+    del_dups = 0
+    seen = set()
+
+    # Iterate deterministically to keep the same file each run
+    for txt in sorted(split_dir.rglob("*.txt"), key=lambda p: p.name):
+        stem = txt.stem
+        if stem not in jpg_stems:
+            txt.unlink(missing_ok=True)
+            del_unmatched += 1
+            continue
+        if stem in seen:
+            txt.unlink(missing_ok=True)
+            del_dups += 1
+            continue
+        seen.add(stem)
+        kept += 1
+    return kept, del_unmatched, del_dups
+
+def main():
+    stats = extract_txts()
+    print(f"Extracted: {stats}")
+
+    jpg_index, stem_to_split = build_jpg_indexes()
+    moved, deleted = place_staged_txt(jpg_index, stem_to_split)
+    print(f"Staged moved: {moved}, staged deleted: {deleted}")
+
+    for split in ("train", "validation", "test"):
+        kept, del_unmatched, del_dups = enforce_per_split(split, jpg_index[split])
+        print(f"[{split}] kept={kept} del_unmatched={del_unmatched} del_dups={del_dups}")
+
+    # Optional: clean up empty staging dir
+    try:
+        (ROOT / "_staging_txt").rmdir()
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    main()

@@ -1,43 +1,44 @@
 from pathlib import Path
 
-# Root dataset directory
-root_dir = Path("/opt/dlami/nvme/datasets/coco17")
+train_dir = Path("/opt/dlami/nvme/datasets/coco17/train")
 
-# Collect all jpg basenames
-jpg_stems = {p.stem for p in root_dir.rglob("*.jpg")}
+jpg_stems = {p.stem for p in train_dir.glob("*.jpg")}
+json_stems = {p.stem for p in train_dir.glob("*.json")}
+txt_stems = {p.stem for p in train_dir.glob("*.txt")}
 
-deleted_unmatched = 0
-deleted_duplicates = 0
-kept = 0
+# Rogue JSONs (no matching JPG)
+rogue_jsons = [train_dir / f"{stem}.json" for stem in (json_stems - jpg_stems)]
 
-seen = set()  # track which txt stems we've already kept
+# Rogue TXTs (no matching JPG)
+rogue_txts = [train_dir / f"{stem}.txt" for stem in (txt_stems - jpg_stems)]
 
-for txt_file in root_dir.rglob("*.txt"):
-    stem = txt_file.stem
+# JPGs missing JSON
+jpg_missing_json = [train_dir / f"{stem}.jpg" for stem in (jpg_stems - json_stems)]
 
-    # Case 1: no matching jpg -> delete
-    if stem not in jpg_stems:
-        try:
-            txt_file.unlink()
-            deleted_unmatched += 1
-        except Exception as e:
-            print(f"[warn] failed to delete {txt_file}: {e}")
-        continue
+# JPGs missing TXT
+jpg_missing_txt = [train_dir / f"{stem}.jpg" for stem in (jpg_stems - txt_stems)]
 
-    # Case 2: duplicate txt -> delete
-    if stem in seen:
-        try:
-            txt_file.unlink()
-            deleted_duplicates += 1
-        except Exception as e:
-            print(f"[warn] failed to delete {txt_file}: {e}")
-        continue
+print("=== Rogue JSONs (delete these) ===")
+for f in rogue_jsons:
+    print(f)
 
-    # Case 3: keep the first valid txt
-    seen.add(stem)
-    kept += 1
+print("\n=== Rogue TXTs (should not exist) ===")
+for f in rogue_txts:
+    print(f)
 
-print(f"Done.")
-print(f"  Kept: {kept} unique txt files with matching jpg")
-print(f"  Deleted unmatched txt files: {deleted_unmatched}")
-print(f"  Deleted duplicate txt files: {deleted_duplicates}")
+print("\n=== JPGs missing JSON ===")
+for f in jpg_missing_json[:20]:  # only show first 20
+    print(f)
+if len(jpg_missing_json) > 20:
+    print(f"... and {len(jpg_missing_json)-20} more")
+
+print("\n=== JPGs missing TXT ===")
+for f in jpg_missing_txt[:20]:
+    print(f)
+if len(jpg_missing_txt) > 20:
+    print(f"... and {len(jpg_missing_txt)-20} more")
+
+# Uncomment this block to auto-delete the rogues
+# for f in rogue_jsons + rogue_txts:
+#     print(f"Deleting {f}")
+#     f.unlink()
