@@ -1986,10 +1986,16 @@ def get_argument_parser():
         ),
     )
     parser.add_argument(
-        "--geodesicflow_gamma",
+        "--geodesicflow_alpha",
         type=float,
-        default=0.1,
-        help="Gamma for GeodesicFlow",
+        default=5,
+        help="Alpha for GeodesicFlow",
+    )
+    parser.add_argument(
+        "--geodesicflow_beta",
+        type=float,
+        default=10,
+        help="Beta for GeodesicFlow",
     )
     parser.add_argument(
         "--geodesicflow_staticlambda",

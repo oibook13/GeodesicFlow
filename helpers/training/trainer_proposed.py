@@ -361,10 +361,13 @@ class Trainer:
         # GeodesicFlow settings - enabled by default as requested.
         if not hasattr(self.config, 'geodesicflow_enabled'):
             self.config.geodesicflow_enabled = True
-        if not hasattr(self.config, 'geodesicflow_gamma'):
-            self.config.geodesicflow_gamma = 0.1
+        if not hasattr(self.config, 'geodesicflow_alpha'):
+            self.config.geodesicflow_alpha = 10.0
+        if not hasattr(self.config, 'geodesicflow_beta'):
+            self.config.geodesicflow_beta = 5.0
+            
         if self.config.geodesicflow_enabled:
-            logger.info(f"GeodesicFlow enabled with gamma = {self.config.geodesicflow_gamma}")
+            logger.info(f"GeodesicFlow enabled with alpha = {self.config.geodesicflow_alpha}, beta = {self.config.geodesicflow_beta}")
 
     def set_model_family(self, model_family: str = None):
         model_family = getattr(self.config, "model_family", model_family)
@@ -2337,10 +2340,15 @@ class Trainer:
                         z_t_euc = (1 - t_dist) * x0 + t_dist * x1
                         u_t_euc = x1 - x0
                         
-                        # 4. Compute adaptive blending weight lambda
+                        # 4. Compute adaptive blending weight lambda using the NEW FORMULA
                         u_t_geo_flat = u_t_geo.view(u_t_geo.shape[0], -1)
-                        rho = torch.norm(u_t_geo_flat, p=2, dim=1, keepdim=True) # Correct shape: (batch_size, 1)
-                        lambda_val = torch.sigmoid(-self.config.geodesicflow_gamma * rho)
+                        rho = torch.norm(u_t_geo_flat, p=2, dim=1, keepdim=True)
+                        
+                        # Normalize rho and apply the new formula for lambda
+                        normalized_rho = rho / math.pi
+                        lambda_val = torch.sigmoid(
+                            self.config.geodesicflow_alpha * (1.0 - normalized_rho) - self.config.geodesicflow_beta
+                        )
 
                         # Set dummy `noisy_latents` and `target` for compatibility with the rest of the block,
                         # as loss is computed differently for GeodesicFlow.
@@ -2374,6 +2382,7 @@ class Trainer:
                     training_logger.debug(
                         f"Pooled embeds: {add_text_embeds.shape if add_text_embeds is not None else None}"
                     )
+
                     # Get the target for loss depending on the prediction type
                     if self.config.flow_matching:
                         # For GeodesicFlow, the 'target' is handled within its specialized loss calculation
@@ -2406,6 +2415,7 @@ class Trainer:
                                 f"Unknown prediction type {prediction_type}. "
                                 "Supported types are 'epsilon', 'sample', and 'v_prediction'."
                             )
+
 
                     added_cond_kwargs = None
                     # Predict the noise residual and compute loss
