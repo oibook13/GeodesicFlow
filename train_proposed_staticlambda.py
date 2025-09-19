@@ -1,4 +1,4 @@
-from helpers.training.trainer_proposed import Trainer
+from helpers.training.trainer_proposed_staticlambda import Trainer
 from helpers.training.state_tracker import StateTracker
 from helpers import log_format
 import logging

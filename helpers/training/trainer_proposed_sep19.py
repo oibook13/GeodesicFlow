@@ -1,3 +1,5 @@
+# trainer.py
+
 import huggingface_hub
 from helpers.training.default_settings.safety_check import safety_check
 from helpers.publishing.huggingface import HubManager
@@ -74,6 +76,7 @@ training_logger.setLevel(training_logger_level)
 filelock_logger.setLevel("WARNING")
 connection_logger.setLevel("WARNING")
 import torch
+import torch.nn as nn
 import diffusers
 import accelerate
 import transformers
@@ -175,6 +178,7 @@ class Trainer:
         self.text_encoder_3 = None
         self.controlnet = None
         self.validation = None
+        self.metric_network = None # GeodesicFlow: Initialize metric network
 
     def _config_to_obj(self, config):
         if not config:
@@ -184,6 +188,21 @@ class Trainer:
     def parse_arguments(self, args=None, disable_accelerator: bool = False):
         self.config = load_config(args)
         
+        # GeodesicFlow: Add default hyperparameters and enable by default
+        setattr(self.config, 'geodesicflow_enabled', getattr(self.config, 'geodesicflow_enabled', True))
+        setattr(self.config, 'geodesicflow_metric_lr', getattr(self.config, 'geodesicflow_metric_lr', self.config.learning_rate))
+        # Epsilon (ε) for numerical stability and metric definition g = LL^T + εI.
+        setattr(self.config, 'geodesicflow_metric_eps', getattr(self.config, 'geodesicflow_metric_eps', 1e-4))
+        # Lambda (λ) for the metric regularization loss term weight.
+        setattr(self.config, 'geodesicflow_metric_reg_lambda', getattr(self.config, 'geodesicflow_metric_reg_lambda', 1e-4))
+        # Use a very small U-Net for the metric network by default
+        setattr(self.config, 'geodesicflow_metric_config', getattr(self.config, 'geodesicflow_metric_config', {
+            "block_out_channels": (64, 128),
+            "down_block_types": ("DownBlock2D", "CrossAttnDownBlock2D"),
+            "up_block_types": ("CrossAttnUpBlock2D", "UpBlock2D"),
+            "attention_head_dim": 8,
+        }))
+
         report_to = (
             None if self.config.report_to.lower() == "none" else self.config.report_to
         )
@@ -234,6 +253,7 @@ class Trainer:
                     self.init_unload_text_encoder,
                     self.init_unload_vae,
                     self.init_load_base_model,
+                    self.init_geodesicflow_metric_network, # GeodesicFlow: Initialize metric network
                     self.init_precision,
                     self.init_controlnet_model,
                     self.init_freeze_models,
@@ -357,14 +377,6 @@ class Trainer:
             from helpers.training.quantisation import quantise_model
 
             self.quantise_model = quantise_model
-            
-        # GeodesicFlow settings - enabled by default as requested.
-        if not hasattr(self.config, 'geodesicflow_enabled'):
-            self.config.geodesicflow_enabled = True
-        if not hasattr(self.config, 'geodesicflow_gamma'):
-            self.config.geodesicflow_gamma = 0.1
-        if self.config.geodesicflow_enabled:
-            logger.info(f"GeodesicFlow enabled with gamma = {self.config.geodesicflow_gamma}")
 
     def set_model_family(self, model_family: str = None):
         model_family = getattr(self.config, "model_family", model_family)
@@ -619,6 +631,56 @@ class Trainer:
             structured_data={"message": "Base model has loaded."},
             message_type="init_load_base_model_completed",
         )
+
+    # GeodesicFlow: New method to initialize the adaptive metric network
+    def init_geodesicflow_metric_network(self):
+        if not self.config.geodesicflow_enabled:
+            return
+
+        primary_model = self.unet if self.unet is not None else self.transformer
+        if primary_model is None:
+            logger.error("Primary model (U-Net or Transformer) not loaded. Cannot initialize GeodesicFlow metric network.")
+            return
+
+        logger.info("Initializing GeodesicFlow Adaptive Metric Network (g_Φ).")
+        
+        # Create a mutable copy of the metric network config from your main config
+        metric_network_config = dict(self.config.geodesicflow_metric_config)
+        model_config = primary_model.config
+
+        # --- Robust Logic to Find the Correct Dimension Key ---
+        
+        # 1. Check for a manual override first
+        cross_attn_dim = None # self.config.geodesicflow_metric_cross_attn_dim
+
+        # 2. If no override, try to infer the dimension automatically
+        if cross_attn_dim is None:
+            # This list includes 'joint_attention_dim', which will be found in your model's config
+            possible_keys = ['cross_attention_dim', 'text_embed_dim', 'joint_attention_dim', 'hidden_size']
+            for key in possible_keys:
+                if key in model_config:
+                    cross_attn_dim = model_config[key]
+                    logger.info(f"Inferred cross-attention dimension for metric network from key '{key}': {cross_attn_dim}")
+                    break
+        
+        # 3. If auto-detection fails, raise an informative error
+        if cross_attn_dim is None:
+            raise ValueError(
+                "Could not automatically determine the cross-attention dimension for the GeodesicFlow metric network. "
+                "Please specify it manually in your config using the 'geodesicflow_metric_cross_attn_dim' parameter. "
+                f"The primary model's config keys are: {list(model_config.keys())}"
+            )
+        # --- End of Logic ---
+
+        metric_network_config["cross_attention_dim"] = cross_attn_dim
+        metric_network_config["in_channels"] = model_config['in_channels']
+        metric_network_config["out_channels"] = model_config['out_channels']
+        
+        self.metric_network = UNet2DConditionModel(**metric_network_config)
+        
+        num_params = sum(p.numel() for p in self.metric_network.parameters()) / 1e6
+        logger.info(f"GeodesicFlow metric network initialized with {num_params:.2f}M parameters.")
+
 
     def init_data_backend(self):
         try:
@@ -1000,6 +1062,11 @@ class Trainer:
                 unwrap_model(
                     self.accelerator, self.text_encoder_2
                 ).gradient_checkpointing_enable()
+            # GeodesicFlow: Enable gradient checkpointing for the metric network
+            if self.config.geodesicflow_enabled and self.metric_network is not None:
+                logger.info("Enabling gradient checkpointing for GeodesicFlow metric network.")
+                unwrap_model(self.accelerator, self.metric_network).enable_gradient_checkpointing()
+
 
     def _recalculate_training_steps(self):
         # Scheduler and math around the number of training steps.
@@ -1082,7 +1149,7 @@ class Trainer:
         )
         extra_optimizer_args.update(optimizer_args_from_config)
 
-        self.params_to_optimize = determine_params_to_optimize(
+        params_to_optimize = determine_params_to_optimize(
             args=self.config,
             controlnet=self.controlnet,
             unet=self.unet,
@@ -1093,6 +1160,28 @@ class Trainer:
             lycoris_wrapped_network=self.lycoris_wrapped_network,
         )
 
+        # --- Start of New Robust Logic ---
+        # Ensure params_to_optimize is a list, not a generator
+        if not isinstance(params_to_optimize, list):
+            params_to_optimize = list(params_to_optimize)
+
+        # Defensively check if we have a flat list of tensors and, if so,
+        # wrap it in the standard parameter group structure.
+        if params_to_optimize and isinstance(params_to_optimize[0], torch.Tensor):
+            logger.debug("Detected a flat list of parameters; wrapping it in a parameter group.")
+            params_to_optimize = [{"params": params_to_optimize}]
+        
+        self.params_to_optimize = params_to_optimize
+        # --- End of New Robust Logic ---
+
+        # GeodesicFlow: Add metric network parameters as a new parameter group
+        if self.config.geodesicflow_enabled and self.metric_network is not None:
+            logger.info(f"Adding GeodesicFlow metric network parameters to optimizer with LR: {self.config.geodesicflow_metric_lr}")
+            self.params_to_optimize.append({
+                "params": list(self.metric_network.parameters()),
+                "lr": self.config.geodesicflow_metric_lr,
+            })
+
         if self.config.use_deepspeed_optimizer:
             logger.info(
                 f"DeepSpeed Optimizer arguments, weight_decay={self.config.adam_weight_decay} eps={self.config.adam_epsilon}, extra_arguments={extra_optimizer_args}"
@@ -1101,11 +1190,13 @@ class Trainer:
         else:
             logger.info(f"Optimizer arguments={extra_optimizer_args}")
             if self.config.train_text_encoder and self.config.text_encoder_lr:
-                # changes the learning rate of text_encoder_parameters_one and text_encoder_parameters_two to be
-                # --learning_rate
-                self.params_to_optimize[1]["lr"] = float(self.config.learning_rate)
-                if self.text_encoder_2 is not None:
-                    self.params_to_optimize[2]["lr"] = float(self.config.learning_rate)
+                # This logic assumes the text encoder params are at specific indices
+                if len(self.params_to_optimize) > 2:
+                    self.params_to_optimize[1]["lr"] = float(self.config.learning_rate)
+                    if self.text_encoder_2 is not None:
+                        self.params_to_optimize[2]["lr"] = float(self.config.learning_rate)
+                else:
+                    logger.warning("Could not set text encoder LR; parameter group structure is not as expected.")
 
             self.optimizer = cpu_offload_optimizer(
                 params_to_optimize=self.params_to_optimize,
@@ -1114,23 +1205,6 @@ class Trainer:
                 fused=self.config.fuse_optimizer,
                 offload_gradients=self.config.optimizer_offload_gradients,
                 offload_mechanism=self.config.optimizer_cpu_offload_method,
-            )
-
-        if (
-            is_optimi_available
-            and self.config.optimizer_release_gradients
-            and "optimi" in self.config.optimizer
-        ):
-            logger.warning(
-                "Marking model for gradient release. This feature is experimental, and may use more VRAM or not work."
-            )
-            prepare_for_gradient_release(
-                (
-                    self.controlnet
-                    if self.config.controlnet
-                    else self.transformer if self.transformer is not None else self.unet
-                ),
-                self.optimizer,
             )
 
     def init_lr_scheduler(self):
@@ -1258,19 +1332,37 @@ class Trainer:
             structured_data={"message": "Moving weights to GPU"},
             message_type="init_prepare_models_begin",
         )
+        
+        # GeodesicFlow: Prepare the metric network along with other components
+        models_to_prepare = []
         primary_model = self.unet if self.unet is not None else self.transformer
         if self.config.controlnet:
             primary_model = self.controlnet
-        results = self.accelerator.prepare(
-            primary_model, lr_scheduler, self.optimizer, self.train_dataloaders[0]
-        )
-        if self.config.controlnet:
-            self.controlnet = results[0]
-        elif self.unet is not None:
-            self.unet = results[0]
-        elif self.transformer is not None:
-            self.transformer = results[0]
+        
+        models_to_prepare.append(primary_model)
+        if self.config.geodesicflow_enabled and self.metric_network is not None:
+            models_to_prepare.append(self.metric_network)
 
+        results = self.accelerator.prepare(
+            *models_to_prepare, lr_scheduler, self.optimizer, self.train_dataloaders[0]
+        )
+        
+        # Re-assign models from results
+        model_idx = 0
+        if self.config.controlnet:
+            self.controlnet = results[model_idx]
+            model_idx += 1
+        elif self.unet is not None:
+            self.unet = results[model_idx]
+            model_idx += 1
+        elif self.transformer is not None:
+            self.transformer = results[model_idx]
+            model_idx += 1
+
+        if self.config.geodesicflow_enabled and self.metric_network is not None:
+            self.metric_network = results[model_idx]
+            model_idx += 1
+            
         if self.config.unet_attention_slice:
             if torch.backends.mps.is_available():
                 logger.warning(
@@ -1280,10 +1372,11 @@ class Trainer:
                 self.unet.set_attention_slice("auto")
             if self.transformer is not None:
                 self.transformer.set_attention_slice("auto")
-        self.lr_scheduler = results[1]
-        self.optimizer = results[2]
+
+        self.lr_scheduler = results[model_idx]
+        self.optimizer = results[model_idx + 1]
         # The rest of the entries are dataloaders:
-        self.train_dataloaders = [results[3:]]
+        self.train_dataloaders = [results[model_idx + 2:]]
         if self.config.use_ema and self.ema_model is not None:
             if self.config.ema_device == "accelerator":
                 logger.info("Moving EMA model weights to accelerator...")
@@ -1592,6 +1685,12 @@ class Trainer:
                 self.transformer.to(target_device)
             else:
                 self.transformer.to(target_device, dtype=self.config.weight_dtype)
+        
+        # GeodesicFlow: Move metric network to the target device
+        if self.config.geodesicflow_enabled and self.metric_network is not None:
+            logger.info(f"Moving GeodesicFlow metric network to {target_device} in {self.config.weight_dtype} precision.")
+            self.metric_network.to(target_device, dtype=self.config.weight_dtype)
+
         if getattr(self.accelerator, "_lycoris_wrapped_network", None) is not None:
             self.accelerator._lycoris_wrapped_network = (
                 self.accelerator._lycoris_wrapped_network.to(
@@ -1700,6 +1799,11 @@ class Trainer:
         if self.state["global_step"] > 1:
             initial_msg += f"\n  - Steps completed: {self.state['global_step']}"
         initial_msg += f"\n-  Total optimization steps remaining = {max(0, self.config.total_steps_remaining_at_start)}"
+        if self.config.geodesicflow_enabled:
+            initial_msg += f"\n-  GeodesicFlow Training Enabled"
+            initial_msg += f"\n  - Metric LR: {self.config.geodesicflow_metric_lr}"
+            initial_msg += f"\n  - Metric Epsilon (ε): {self.config.geodesicflow_metric_eps}"
+            initial_msg += f"\n  - Metric Reg Lambda (λ): {self.config.geodesicflow_metric_reg_lambda}"
         logger.info(initial_msg)
         self._send_webhook_msg(message=initial_msg)
         structured_data = {
@@ -1711,7 +1815,12 @@ class Trainer:
             "micro_batch_size": self.config.train_batch_size,
             "current_step": self.state["global_step"],
             "remaining_num_steps": max(0, self.config.total_steps_remaining_at_start),
+            "geodesicflow_enabled": self.config.geodesicflow_enabled,
         }
+        if self.config.geodesicflow_enabled:
+            structured_data["geodesicflow_metric_lr"] = self.config.geodesicflow_metric_lr
+            structured_data["geodesicflow_metric_eps"] = self.config.geodesicflow_metric_eps
+            structured_data["geodesicflow_metric_reg_lambda"] = self.config.geodesicflow_metric_reg_lambda
         self._send_webhook_raw(
             structured_data=structured_data, message_type="_train_initial_msg"
         )
@@ -2035,21 +2144,7 @@ class Trainer:
             model_pred = torch.randn_like(noisy_latents)
 
         return model_pred
-        
-    # ================================================================================= #
-    #                          GeodesicFlow Helper Methods                              #
-    # ================================================================================= #
-    
-    def _geodesicflow_project_to_tangent(self, v, p):
-        """
-        Projects vector v onto the tangent space of the sphere at point p.
-        """
-        return v - torch.sum(v * p, dim=1, keepdim=True) * p
 
-    # ================================================================================= #
-    #                                End Helper Methods                                 #
-    # ================================================================================= #
-    
     def train(self):
         self.init_trackers()
         self._train_initial_msg()
@@ -2090,16 +2185,24 @@ class Trainer:
                 )
                 break
             self._epoch_rollover(epoch)
+            
+            training_models = []
             if self.config.controlnet:
                 self.controlnet.train()
-                training_models = [self.controlnet]
+                training_models.append(self.controlnet)
             else:
                 if self.unet is not None:
                     self.unet.train()
-                    training_models = [self.unet]
+                    training_models.append(self.unet)
                 if self.transformer is not None:
                     self.transformer.train()
-                    training_models = [self.transformer]
+                    training_models.append(self.transformer)
+            
+            # GeodesicFlow: Set metric network to train mode
+            if self.config.geodesicflow_enabled and self.metric_network is not None:
+                self.metric_network.train()
+                training_models.append(self.metric_network)
+
             if (
                 "lora" in self.config.model_type
                 and self.config.train_text_encoder
@@ -2252,8 +2355,8 @@ class Trainer:
                                 random.choices(available_sigmas, k=bsz),
                                 device=self.accelerator.device,
                             )
-                        timesteps_for_model = sigmas * 1000.0
-                        sigmas = sigmas.view(-1, 1, 1, 1)
+                        timesteps = sigmas * 1000.0
+                        sigmas_view = sigmas.view(-1, 1, 1, 1)
                     else:
                         # Sample a random timestep for each image, potentially biased by the timestep weights.
                         # Biasing the timestep weights allows us to spend less time training irrelevant timesteps.
@@ -2277,10 +2380,9 @@ class Trainer:
                             timesteps = torch.multinomial(
                                 weights, bsz, replacement=True
                             ).long()
-                        timesteps_for_model = timesteps
 
                     # Prepare the data for the scatter plot
-                    for timestep in timesteps_for_model.tolist():
+                    for timestep in timesteps.tolist():
                         self.timesteps_buffer.append(
                             (self.state["global_step"], timestep)
                         )
@@ -2301,54 +2403,9 @@ class Trainer:
                         )
                     else:
                         input_noise = noise
-                        
-                    # ================================================================================= #
-                    #                        GeodesicFlow Core Logic Starts                             #
-                    # ================================================================================= #
-                    
-                    if self.config.flow_matching and self.config.geodesicflow_enabled:
-                        t_dist = sigmas.to(torch.float32) # Time distribution t ~ U[0,1]
-                        epsilon = 1e-8
-                        
-                        # 1. Ensure points x0 (data) and x1 (noise) are on the unit sphere.
-                        x0 = F.normalize(latents.to(torch.float32), p=2, dim=1)
-                        x1 = F.normalize(input_noise.to(torch.float32), p=2, dim=1)
 
-                        # 2. Compute Geodesic path quantities
-                        dot_product = torch.sum(x0 * x1, dim=1, keepdim=True).clamp(-1.0 + epsilon, 1.0 - epsilon)
-                        theta = torch.acos(dot_product)
-                        
-                        v0_direction = x1 - dot_product * x0
-                        v0_direction_norm = torch.norm(v0_direction, p=2, dim=1, keepdim=True)
-                        v0 = theta * (v0_direction / (v0_direction_norm + epsilon))
-
-                        sin_theta = torch.sin(theta)
-                        # Use linear interpolation for small angles to avoid numerical instability
-                        a = torch.where(sin_theta > epsilon, torch.sin((1 - t_dist) * theta) / sin_theta, 1.0 - t_dist)
-                        b = torch.where(sin_theta > epsilon, torch.sin(t_dist * theta) / sin_theta, t_dist)
-                        z_t_geo = a * x0 + b * x1
-                        z_t_geo = F.normalize(z_t_geo, p=2, dim=1) # Renormalize to correct floating point drift
-                        
-                        denominator = 1 - dot_product**2
-                        v0_dot_zt_geo = torch.sum(v0 * z_t_geo, dim=1, keepdim=True)
-                        u_t_geo = v0 - (v0_dot_zt_geo / (denominator + epsilon)) * v0_direction
-
-                        # 3. Compute Euclidean path quantities
-                        z_t_euc = (1 - t_dist) * x0 + t_dist * x1
-                        u_t_euc = x1 - x0
-                        
-                        # 4. Compute adaptive blending weight lambda
-                        u_t_geo_flat = u_t_geo.view(u_t_geo.shape[0], -1)
-                        rho = torch.norm(u_t_geo_flat, p=2, dim=1, keepdim=True) # Correct shape: (batch_size, 1)
-                        lambda_val = torch.sigmoid(-self.config.geodesicflow_gamma * rho)
-
-                        # Set dummy `noisy_latents` and `target` for compatibility with the rest of the block,
-                        # as loss is computed differently for GeodesicFlow.
-                        noisy_latents = z_t_euc # Can be anything, just a placeholder
-                        target = u_t_euc # Placeholder
-                        
-                    elif self.config.flow_matching:
-                        noisy_latents = (1 - sigmas) * latents + sigmas * input_noise
+                    if self.config.flow_matching:
+                        noisy_latents = (1 - sigmas_view) * latents + sigmas_view * input_noise
                     else:
                         # Add noise to the latents according to the noise magnitude at each timestep
                         # (this is the forward diffusion process)
@@ -2358,11 +2415,7 @@ class Trainer:
                             device=self.accelerator.device,
                             dtype=self.config.weight_dtype,
                         )
-                        
-                    # ================================================================================= #
-                    #                         GeodesicFlow Core Logic Ends                              #
-                    # ================================================================================= #
-                    
+
                     encoder_hidden_states = batch["prompt_embeds"].to(
                         dtype=self.config.weight_dtype, device=self.accelerator.device
                     )
@@ -2376,36 +2429,29 @@ class Trainer:
                     )
                     # Get the target for loss depending on the prediction type
                     if self.config.flow_matching:
-                        # For GeodesicFlow, the 'target' is handled within its specialized loss calculation
-                        # and this block is effectively skipped. For vanilla flow matching, we set the target here.
-                        if not self.config.geodesicflow_enabled:
-                            if self.config.flow_matching_loss == "diffusers":
-                                target = latents
-                            elif self.config.flow_matching_loss == "compatible":
-                                target = noise - latents
-                            elif self.config.flow_matching_loss == "sd35":
-                                target = (noisy_latents - latents) / sigmas
-                            elif self.config.flow_matching_loss == "diffusion":
-                                # This specific flow matching loss uses a v-prediction style target
-                                target = self.noise_scheduler.get_velocity(latents, noise, timesteps_for_model)
-                            else:
-                                # Default to a standard target if loss type is unspecified
-                                target = latents
-                    else:
-                        # This is for standard, non-flow-matching diffusion training.
-                        # We safely get the prediction_type, defaulting to 'epsilon' if it's not present.
-                        prediction_type = getattr(self.noise_scheduler.config, 'prediction_type', 'epsilon')
-                        if prediction_type == "epsilon":
-                            target = noise
-                        elif prediction_type == "v_prediction":
-                            target = self.noise_scheduler.get_velocity(latents, noise, timesteps_for_model)
-                        elif prediction_type == "sample":
+                        # GeodesicFlow uses the 'compatible' target, which is velocity.
+                        if self.config.geodesicflow_enabled:
+                            target = input_noise - latents
+                        elif self.config.flow_matching_loss == "diffusers":
                             target = latents
-                        else:
-                            raise ValueError(
-                                f"Unknown prediction type {prediction_type}. "
-                                "Supported types are 'epsilon', 'sample', and 'v_prediction'."
-                            )
+                        elif self.config.flow_matching_loss == "compatible":
+                            target = input_noise - latents
+                        elif self.config.flow_matching_loss == "sd35":
+                            sigma_reshaped = sigmas_view  # Ensure sigma has the correct shape
+                            target = (noisy_latents - latents) / sigma_reshaped
+                    elif self.noise_scheduler.config.prediction_type == "epsilon":
+                        target = noise
+                    elif self.noise_scheduler.config.prediction_type == "v_prediction":
+                        target = self.noise_scheduler.get_velocity(
+                            latents, noise, timesteps
+                        )
+                    elif self.noise_scheduler.config.prediction_type == "sample":
+                        target = latents
+                    else:
+                        raise ValueError(
+                            f"Unknown prediction type {self.noise_scheduler.config.prediction_type}"
+                            "Supported types are 'epsilon', `sample`, and 'v_prediction'."
+                        )
 
                     added_cond_kwargs = None
                     # Predict the noise residual and compute loss
@@ -2460,7 +2506,7 @@ class Trainer:
                                 encoder_hidden_states=encoder_hidden_states,
                                 added_cond_kwargs=added_cond_kwargs,
                                 add_text_embeds=add_text_embeds,
-                                timesteps=timesteps_for_model,
+                                timesteps=timesteps,
                             )
                             if self.config.lora_type.lower() == "lycoris":
                                 training_logger.debug(
@@ -2468,55 +2514,17 @@ class Trainer:
                                 )
                                 self.accelerator._lycoris_wrapped_network.apply_to()
 
-                    # ================================================================================= #
-                    #                        GeodesicFlow Loss Calculation                              #
-                    # ================================================================================= #
-                    
-                    if self.config.flow_matching and self.config.geodesicflow_enabled:
-                        # 5. Get model predictions for both paths
-                        pred_geo_raw = self.model_predict(
-                            batch=batch, latents=latents, noisy_latents=z_t_geo.to(latents.dtype),
-                            encoder_hidden_states=encoder_hidden_states, added_cond_kwargs=added_cond_kwargs,
-                            add_text_embeds=add_text_embeds, timesteps=timesteps_for_model
-                        )
-                        # Project prediction to the tangent space for geometric correctness
-                        pred_geo = self._geodesicflow_project_to_tangent(pred_geo_raw, z_t_geo)
+                    training_logger.debug("Predicting noise residual.")
+                    model_pred = self.model_predict(
+                        batch=batch,
+                        latents=latents,
+                        noisy_latents=noisy_latents,
+                        encoder_hidden_states=encoder_hidden_states,
+                        added_cond_kwargs=added_cond_kwargs,
+                        add_text_embeds=add_text_embeds,
+                        timesteps=timesteps,
+                    )
 
-                        pred_euc = self.model_predict(
-                            batch=batch, latents=latents, noisy_latents=z_t_euc.to(latents.dtype),
-                            encoder_hidden_states=encoder_hidden_states, added_cond_kwargs=added_cond_kwargs,
-                            add_text_embeds=add_text_embeds, timesteps=timesteps_for_model
-                        )
-
-                        # 6. Compute the adaptive blended loss
-                        loss_geo_per_pixel = F.mse_loss(pred_geo.float(), u_t_geo.float(), reduction='none')
-                        loss_euc_per_pixel = F.mse_loss(pred_euc.float(), u_t_euc.float(), reduction='none')
-
-                        loss_geo_per_sample = loss_geo_per_pixel.mean(dim=list(range(1, len(loss_geo_per_pixel.shape))))
-                        loss_euc_per_sample = loss_euc_per_pixel.mean(dim=list(range(1, len(loss_euc_per_pixel.shape))))
-
-                        # Squeeze lambda_val to match batch dimension
-                        blended_loss_per_sample = (1.0 - lambda_val.squeeze()) * loss_euc_per_sample + lambda_val.squeeze() * loss_geo_per_sample
-                        
-                        loss = blended_loss_per_sample.mean()
-                        model_pred = pred_euc # Set for compatibility, not used in loss
-                    else:
-                        training_logger.debug("Predicting noise residual.")
-                        model_pred = self.model_predict(
-                            batch=batch,
-                            latents=latents,
-                            noisy_latents=noisy_latents,
-                            encoder_hidden_states=encoder_hidden_states,
-                            added_cond_kwargs=added_cond_kwargs,
-                            add_text_embeds=add_text_embeds,
-                            timesteps=timesteps_for_model,
-                        )
-                    
-                    # ================================================================================= #
-                    #                        End GeodesicFlow Loss Calculation                          #
-                    # ================================================================================= #
-
-                    # x-prediction requires that we now subtract the noise residual from the prediction to get the target sample.
                     if (
                         hasattr(self.noise_scheduler, "config")
                         and hasattr(self.noise_scheduler.config, "prediction_type")
@@ -2527,33 +2535,54 @@ class Trainer:
                     parent_loss = None
 
                     # Compute the per-pixel loss without reducing over spatial dimensions
-                    if self.config.flow_matching and not self.config.geodesicflow_enabled:
+                    if self.config.geodesicflow_enabled:
+                        # GeodesicFlow Loss Calculation
+                        residual = model_pred.float() - target.float()
+                        
+                        # The metric network Φ predicts the log-diagonal entries of the Cholesky factor L.
+                        # h_diag = MLP_Φ(z_t, t, c)
+                        log_diag_L = self.metric_network(
+                            noisy_latents,
+                            timesteps,
+                            encoder_hidden_states,
+                            added_cond_kwargs=added_cond_kwargs,
+                        ).sample
+
+                        # diag(L) = exp(h_diag)
+                        diag_L = torch.exp(log_diag_L)
+                        
+                        # The metric g = L L^T + εI. Since L is diagonal, g is also diagonal.
+                        # diag(g) = diag(L)^2 + ε
+                        diag_g = diag_L.float().pow(2) + self.config.geodesicflow_metric_eps
+                        
+                        # The main objective is the squared norm of the residual w.r.t. the metric g.
+                        # ||r||_g^2 = r^T g^-1 r = Σ (r_i^2 / g_ii)
+                        geo_loss = (residual.pow(2) / diag_g).mean()
+                        
+                        # The metric regularization term R_metric(Φ) penalizes deviations from an isotropic metric.
+                        # For a diagonal L, this simplifies to penalizing diag(L) from deviating from 1.
+                        # R_metric = ||diag(L) - 1||_2^2
+                        metric_reg_loss = torch.mean((diag_L.float() - 1.0).pow(2))
+                        
+                        # The final loss is a weighted sum of the geometric loss and the regularization term.
+                        loss = geo_loss + self.config.geodesicflow_metric_reg_lambda * metric_reg_loss
+                    elif self.config.flow_matching:
                         # For flow matching, compute the per-pixel squared differences
                         loss = (
                             model_pred.float() - target.float()
-                        ) ** 2  # Shape: (batch_size, C, H, W)
-                    elif self.config.geodesicflow_enabled:
-                        # Loss is already computed above
-                        pass
+                        ) ** 2
                     elif self.config.snr_gamma is None or self.config.snr_gamma == 0:
                         training_logger.debug("Calculating loss")
                         loss = self.config.snr_weight * F.mse_loss(
                             model_pred.float(), target.float(), reduction="none"
-                        )  # Shape: (batch_size, C, H, W)
+                        )
                     else:
-                        # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                        # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                        # This is discussed in Section 4.2 of the same paper.
                         training_logger.debug("Using min-SNR loss")
                         snr = compute_snr(timesteps, self.noise_scheduler)
                         snr_divisor = snr
                         if (
                             self.noise_scheduler.config.prediction_type
                             == "v_prediction"
-                            or (
-                                self.config.flow_matching
-                                and self.config.flow_matching_loss == "diffusion"
-                            )
                         ):
                             snr_divisor = snr + 1
 
@@ -2569,55 +2598,41 @@ class Trainer:
                                 dim=1,
                             ).min(dim=1)[0]
                             / snr_divisor
-                        )  # Shape: (batch_size,)
-
-                        # Compute the per-pixel MSE loss without reduction
+                        )
                         loss = F.mse_loss(
                             model_pred.float(), target.float(), reduction="none"
-                        )  # Shape: (batch_size, C, H, W)
-
-                        # Reshape mse_loss_weights for broadcasting and apply to loss
+                        )
                         mse_loss_weights = mse_loss_weights.view(
                             -1, 1, 1, 1
-                        )  # Shape: (batch_size, 1, 1, 1)
-                        loss = loss * mse_loss_weights  # Shape: (batch_size, C, H, W)
+                        )
+                        loss = loss * mse_loss_weights
 
-                    # Mask the loss using any conditioning data
-                    conditioning_type = batch.get("conditioning_type")
-                    if conditioning_type == "mask":
-                        # Adapted from:
-                        # https://github.com/kohya-ss/sd-scripts/blob/main/library/custom_train_functions.py#L482
-                        mask_image = (
-                            batch["conditioning_pixel_values"]
-                            .to(dtype=loss.dtype, device=loss.device)[:, 0]
-                            .unsqueeze(1)
-                        )  # Shape: (batch_size, 1, H', W')
-                        mask_image = torch.nn.functional.interpolate(
-                            mask_image, size=loss.shape[2:], mode="area"
-                        )  # Resize to match loss spatial dimensions
-                        mask_image = mask_image / 2 + 0.5  # Normalize to [0,1]
-                        loss = loss * mask_image  # Element-wise multiplication
-                    
-                    if not (self.config.flow_matching and self.config.geodesicflow_enabled):
-                        # Reduce the loss by averaging over channels and spatial dimensions if not already done
-                        loss = loss.mean(
-                            dim=list(range(1, len(loss.shape)))
-                        )  # Shape: (batch_size,)
-
-                        # Further reduce the loss by averaging over the batch dimension
-                        loss = loss.mean()  # Scalar value
+                    # Reduce loss if not already a scalar (non-GeodesicFlow paths)
+                    if not self.config.geodesicflow_enabled:
+                        conditioning_type = batch.get("conditioning_type")
+                        if conditioning_type == "mask":
+                            mask_image = (
+                                batch["conditioning_pixel_values"]
+                                .to(dtype=loss.dtype, device=loss.device)[:, 0]
+                                .unsqueeze(1)
+                            )
+                            mask_image = torch.nn.functional.interpolate(
+                                mask_image, size=loss.shape[2:], mode="area"
+                            )
+                            mask_image = mask_image / 2 + 0.5
+                            loss = loss * mask_image
+                        
+                        loss = loss.mean(dim=list(range(1, len(loss.shape)))).mean()
 
                     if is_regularisation_data:
                         parent_loss = loss
 
-                    # Gather the losses across all processes for logging (if using distributed training)
                     avg_loss = self.accelerator.gather(
                         loss.repeat(self.config.train_batch_size)
                     ).mean()
                     self.train_loss += (
                         avg_loss.item() / self.config.gradient_accumulation_steps
                     )
-                    # Backpropagate
                     grad_norm = None
                     if not self.config.disable_accelerator:
                         training_logger.debug("Backwards pass.")
@@ -2627,7 +2642,6 @@ class Trainer:
                             self.config.optimizer != "adam_bfloat16"
                             and self.config.gradient_precision == "fp32"
                         ):
-                            # After backward, convert gradients to fp32 for stable accumulation
                             for param in self.params_to_optimize:
                                 if param.grad is not None:
                                     param.grad.data = param.grad.data.to(torch.float32)
@@ -2637,13 +2651,18 @@ class Trainer:
                             and self.config.optimizer != "optimi-stableadamw"
                             and self.config.max_grad_norm > 0
                         ):
-                            # StableAdamW does not need clipping, similar to Adafactor.
+                            # --- Start of Corrected Code ---
+                            # clip_grad_norm_ expects a flat list of Tensors, not a list of parameter group dicts.
+                            # We create a generator to unroll the parameters from all groups.
+                            params_to_clip = (
+                                p for param_group in self.params_to_optimize for p in param_group["params"]
+                            )
                             grad_norm = self.accelerator.clip_grad_norm_(
-                                self.params_to_optimize, self.config.max_grad_norm
+                                params_to_clip, self.config.max_grad_norm
                             )
                         training_logger.debug("Stepping components forward.")
                         if self.config.optimizer_release_gradients:
-                            step_offset = 0  # simpletuner indexes steps from 1.
+                            step_offset = 0
                             should_not_release_gradients = (
                                 step + step_offset
                             ) % self.config.gradient_accumulation_steps != 0
@@ -2659,12 +2678,10 @@ class Trainer:
                             set_to_none=self.config.set_grads_to_none
                         )
 
-                # Checks if the accelerator has performed an optimization step behind the scenes
                 wandb_logs = {}
                 if self.accelerator.sync_gradients:
                     try:
                         if self.config.is_schedulefree:
-                            # hackjob method of retrieving LR from accelerated optims
                             self.lr = StateTracker.get_last_lr()
                         else:
                             self.lr_scheduler.step(**self.extra_lr_scheduler_kwargs)
@@ -2675,14 +2692,16 @@ class Trainer:
                         )
                     wandb_logs = {
                         "train_loss": self.train_loss,
-                        "optimization_loss": loss,
+                        "optimization_loss": loss.item(),
                         "learning_rate": self.lr,
                         "epoch": epoch,
                     }
+                    if self.config.geodesicflow_enabled:
+                        wandb_logs["geo_loss"] = geo_loss.item()
+                        wandb_logs["metric_reg_loss"] = metric_reg_loss.item()
                     if parent_loss is not None:
                         wandb_logs["regularisation_loss"] = parent_loss
                     if self.config.model_family == "flux" and self.guidance_values_list:
-                        # avg the values
                         guidance_values = torch.tensor(self.guidance_values_list).mean()
                         wandb_logs["mean_cfg"] = guidance_values.item()
                         self.guidance_values_list = []
@@ -2708,12 +2727,10 @@ class Trainer:
                             wandb_logs["ema_decay_value"] = self.ema_model.get_decay()
                         self.accelerator.wait_for_everyone()
 
-                    # Log scatter plot to wandb
                     if (
                         self.config.report_to == "wandb"
                         and self.accelerator.is_main_process
                     ):
-                        # Prepare the data for the scatter plot
                         data = [
                             [iteration, timestep]
                             for iteration, timestep in self.timesteps_buffer
@@ -2728,15 +2745,12 @@ class Trainer:
                             title="Timestep distribution by step",
                         )
 
-                    # Clear buffers
                     self.timesteps_buffer = []
 
-                    # Average out the luminance values of each batch, so that we can store that in this step.
-                    if len(training_luminance_values) > 0:
-                        avg_training_data_luminance = sum(training_luminance_values) / len(
-                            training_luminance_values
-                        )
-                        wandb_logs["train_luminance"] = avg_training_data_luminance
+                    avg_training_data_luminance = sum(training_luminance_values) / len(
+                        training_luminance_values
+                    )
+                    wandb_logs["train_luminance"] = avg_training_data_luminance
 
                     logger.debug(
                         f"Step {self.state['global_step']} of {self.config.max_train_steps}: loss {loss.item()}, lr {self.lr}, epoch {epoch}/{self.config.num_train_epochs}, ema_decay_value {ema_decay_value}, train_loss {self.train_loss}"
@@ -2747,7 +2761,6 @@ class Trainer:
                     )
                     webhook_pending_msg = f"Step {self.state['global_step']} of {self.config.max_train_steps}: loss {round(loss.item(), 4)}, lr {self.lr}, epoch {epoch}/{self.config.num_train_epochs}, ema_decay_value {ema_decay_value}, train_loss {round(self.train_loss, 4)}"
 
-                    # Reset some values for the next go.
                     training_luminance_values = []
                     self.train_loss = 0.0
 
@@ -2769,29 +2782,21 @@ class Trainer:
                             structured_data=structured_data, message_type="train"
                         )
                     if self.state["global_step"] % self.config.checkpointing_steps == 0:
-                        # Log global_step and average loss to train_log.txt
                         if self.accelerator.is_main_process:
-                            # log_file_path = os.path.join(self.config.output_dir, "train_log.txt")
-                            # with open(log_file_path, "a") as f:
-                            #     f.write(f"global_step: {self.state['global_step']}, average_loss: {round(avg_loss.item(), 4)}\n")
-                            #     f.flush() # Ensure the data is written to disk immediately
                             log_file_path = os.path.join(self.config.output_dir, "train_log.csv")
-                            # Write header if file does not exist
                             if not os.path.exists(log_file_path):
                                 with open(log_file_path, "w") as f:
                                     f.write("iteration,loss\n")
                             
-                            # Append current step's data.
                             with open(log_file_path, "a") as f:
                                 f.write(f"{self.state['global_step']},{round(avg_loss.item(), 4)}\n")
-                                f.flush()  # Ensure data is written to disk immediately
+                                f.flush()
                         
                         self._send_webhook_msg(
                             message=f"Checkpoint: `{webhook_pending_msg}`",
                             message_level="info",
                         )
                         if self.accelerator.is_main_process:
-                            # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                             if self.config.checkpoints_total_limit is not None:
                                 checkpoints = os.listdir(self.config.output_dir)
                                 checkpoints = [
@@ -2801,7 +2806,6 @@ class Trainer:
                                     checkpoints, key=lambda x: int(x.split("-")[1])
                                 )
 
-                                # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
                                 if (
                                     len(checkpoints)
                                     >= self.config.checkpoints_total_limit
@@ -2840,7 +2844,6 @@ class Trainer:
                                 f"checkpoint-{self.state['global_step']}",
                             )
                             print("\n")
-                            # schedulefree optim needs the optimizer to be in eval mode to save the state (and then back to train after)
                             self.mark_optimizer_eval()
                             self.accelerator.save_state(save_path)
                             self.mark_optimizer_train()

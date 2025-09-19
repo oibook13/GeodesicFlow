@@ -183,6 +183,9 @@ class Trainer:
 
     def parse_arguments(self, args=None, disable_accelerator: bool = False):
         self.config = load_config(args)
+        # GeodesicFlow Parameters
+        self.config.geodesicflow_enabled = getattr(self.config, 'geodesicflow_enabled', True)
+        self.config.geodesicflow_lambda = float(getattr(self.config, 'geodesicflow_staticlambda', 0.5))
         
         report_to = (
             None if self.config.report_to.lower() == "none" else self.config.report_to
@@ -357,14 +360,6 @@ class Trainer:
             from helpers.training.quantisation import quantise_model
 
             self.quantise_model = quantise_model
-            
-        # GeodesicFlow settings - enabled by default as requested.
-        if not hasattr(self.config, 'geodesicflow_enabled'):
-            self.config.geodesicflow_enabled = True
-        if not hasattr(self.config, 'geodesicflow_gamma'):
-            self.config.geodesicflow_gamma = 0.1
-        if self.config.geodesicflow_enabled:
-            logger.info(f"GeodesicFlow enabled with gamma = {self.config.geodesicflow_gamma}")
 
     def set_model_family(self, model_family: str = None):
         model_family = getattr(self.config, "model_family", model_family)
@@ -2035,21 +2030,7 @@ class Trainer:
             model_pred = torch.randn_like(noisy_latents)
 
         return model_pred
-        
-    # ================================================================================= #
-    #                          GeodesicFlow Helper Methods                              #
-    # ================================================================================= #
-    
-    def _geodesicflow_project_to_tangent(self, v, p):
-        """
-        Projects vector v onto the tangent space of the sphere at point p.
-        """
-        return v - torch.sum(v * p, dim=1, keepdim=True) * p
 
-    # ================================================================================= #
-    #                                End Helper Methods                                 #
-    # ================================================================================= #
-    
     def train(self):
         self.init_trackers()
         self._train_initial_msg()
@@ -2252,7 +2233,7 @@ class Trainer:
                                 random.choices(available_sigmas, k=bsz),
                                 device=self.accelerator.device,
                             )
-                        timesteps_for_model = sigmas * 1000.0
+                        timesteps = sigmas * 1000.0
                         sigmas = sigmas.view(-1, 1, 1, 1)
                     else:
                         # Sample a random timestep for each image, potentially biased by the timestep weights.
@@ -2277,10 +2258,9 @@ class Trainer:
                             timesteps = torch.multinomial(
                                 weights, bsz, replacement=True
                             ).long()
-                        timesteps_for_model = timesteps
 
                     # Prepare the data for the scatter plot
-                    for timestep in timesteps_for_model.tolist():
+                    for timestep in timesteps.tolist():
                         self.timesteps_buffer.append(
                             (self.state["global_step"], timestep)
                         )
@@ -2301,53 +2281,8 @@ class Trainer:
                         )
                     else:
                         input_noise = noise
-                        
-                    # ================================================================================= #
-                    #                        GeodesicFlow Core Logic Starts                             #
-                    # ================================================================================= #
-                    
-                    if self.config.flow_matching and self.config.geodesicflow_enabled:
-                        t_dist = sigmas.to(torch.float32) # Time distribution t ~ U[0,1]
-                        epsilon = 1e-8
-                        
-                        # 1. Ensure points x0 (data) and x1 (noise) are on the unit sphere.
-                        x0 = F.normalize(latents.to(torch.float32), p=2, dim=1)
-                        x1 = F.normalize(input_noise.to(torch.float32), p=2, dim=1)
 
-                        # 2. Compute Geodesic path quantities
-                        dot_product = torch.sum(x0 * x1, dim=1, keepdim=True).clamp(-1.0 + epsilon, 1.0 - epsilon)
-                        theta = torch.acos(dot_product)
-                        
-                        v0_direction = x1 - dot_product * x0
-                        v0_direction_norm = torch.norm(v0_direction, p=2, dim=1, keepdim=True)
-                        v0 = theta * (v0_direction / (v0_direction_norm + epsilon))
-
-                        sin_theta = torch.sin(theta)
-                        # Use linear interpolation for small angles to avoid numerical instability
-                        a = torch.where(sin_theta > epsilon, torch.sin((1 - t_dist) * theta) / sin_theta, 1.0 - t_dist)
-                        b = torch.where(sin_theta > epsilon, torch.sin(t_dist * theta) / sin_theta, t_dist)
-                        z_t_geo = a * x0 + b * x1
-                        z_t_geo = F.normalize(z_t_geo, p=2, dim=1) # Renormalize to correct floating point drift
-                        
-                        denominator = 1 - dot_product**2
-                        v0_dot_zt_geo = torch.sum(v0 * z_t_geo, dim=1, keepdim=True)
-                        u_t_geo = v0 - (v0_dot_zt_geo / (denominator + epsilon)) * v0_direction
-
-                        # 3. Compute Euclidean path quantities
-                        z_t_euc = (1 - t_dist) * x0 + t_dist * x1
-                        u_t_euc = x1 - x0
-                        
-                        # 4. Compute adaptive blending weight lambda
-                        u_t_geo_flat = u_t_geo.view(u_t_geo.shape[0], -1)
-                        rho = torch.norm(u_t_geo_flat, p=2, dim=1, keepdim=True) # Correct shape: (batch_size, 1)
-                        lambda_val = torch.sigmoid(-self.config.geodesicflow_gamma * rho)
-
-                        # Set dummy `noisy_latents` and `target` for compatibility with the rest of the block,
-                        # as loss is computed differently for GeodesicFlow.
-                        noisy_latents = z_t_euc # Can be anything, just a placeholder
-                        target = u_t_euc # Placeholder
-                        
-                    elif self.config.flow_matching:
+                    if self.config.flow_matching:
                         noisy_latents = (1 - sigmas) * latents + sigmas * input_noise
                     else:
                         # Add noise to the latents according to the noise magnitude at each timestep
@@ -2358,11 +2293,7 @@ class Trainer:
                             device=self.accelerator.device,
                             dtype=self.config.weight_dtype,
                         )
-                        
-                    # ================================================================================= #
-                    #                         GeodesicFlow Core Logic Ends                              #
-                    # ================================================================================= #
-                    
+
                     encoder_hidden_states = batch["prompt_embeds"].to(
                         dtype=self.config.weight_dtype, device=self.accelerator.device
                     )
@@ -2376,36 +2307,38 @@ class Trainer:
                     )
                     # Get the target for loss depending on the prediction type
                     if self.config.flow_matching:
-                        # For GeodesicFlow, the 'target' is handled within its specialized loss calculation
-                        # and this block is effectively skipped. For vanilla flow matching, we set the target here.
-                        if not self.config.geodesicflow_enabled:
-                            if self.config.flow_matching_loss == "diffusers":
-                                target = latents
-                            elif self.config.flow_matching_loss == "compatible":
-                                target = noise - latents
-                            elif self.config.flow_matching_loss == "sd35":
-                                target = (noisy_latents - latents) / sigmas
-                            elif self.config.flow_matching_loss == "diffusion":
-                                # This specific flow matching loss uses a v-prediction style target
-                                target = self.noise_scheduler.get_velocity(latents, noise, timesteps_for_model)
-                            else:
-                                # Default to a standard target if loss type is unspecified
-                                target = latents
-                    else:
-                        # This is for standard, non-flow-matching diffusion training.
-                        # We safely get the prediction_type, defaulting to 'epsilon' if it's not present.
-                        prediction_type = getattr(self.noise_scheduler.config, 'prediction_type', 'epsilon')
-                        if prediction_type == "epsilon":
-                            target = noise
-                        elif prediction_type == "v_prediction":
-                            target = self.noise_scheduler.get_velocity(latents, noise, timesteps_for_model)
-                        elif prediction_type == "sample":
+                        # This is the flow-matching target for vanilla SD3.
+                        # If self.config.flow_matching_loss == "diffusion", we will instead use v_prediction (see below)
+                        if self.config.flow_matching_loss == "diffusers":
                             target = latents
-                        else:
-                            raise ValueError(
-                                f"Unknown prediction type {prediction_type}. "
-                                "Supported types are 'epsilon', 'sample', and 'v_prediction'."
-                            )
+                        elif self.config.flow_matching_loss == "compatible":
+                            target = noise - latents
+                        elif self.config.flow_matching_loss == "sd35":
+                            sigma_reshaped = sigmas.view(-1, 1, 1, 1)  # Ensure sigma has the correct shape
+                            target = (noisy_latents - latents) / sigma_reshaped
+
+                    elif self.noise_scheduler.config.prediction_type == "epsilon":
+                        target = noise
+                    elif (
+                        self.noise_scheduler.config.prediction_type == "v_prediction"
+                        or (
+                            self.config.flow_matching
+                            and self.config.flow_matching_loss == "diffusion"
+                        )
+                    ):
+                        # When not using flow-matching, train on velocity prediction objective.
+                        target = self.noise_scheduler.get_velocity(
+                            latents, noise, timesteps
+                        )
+                    elif self.noise_scheduler.config.prediction_type == "sample":
+                        # We set the target to latents here, but the model_pred will return the noise sample prediction.
+                        # We will have to subtract the noise residual from the prediction to get the target sample.
+                        target = latents
+                    else:
+                        raise ValueError(
+                            f"Unknown prediction type {self.noise_scheduler.config.prediction_type}"
+                            "Supported types are 'epsilon', `sample`, and 'v_prediction'."
+                        )
 
                     added_cond_kwargs = None
                     # Predict the noise residual and compute loss
@@ -2437,70 +2370,108 @@ class Trainer:
                             dtype=self.config.weight_dtype,
                         )
 
-                    # a marker to know whether we had a model capable of regularised data training.
-                    handled_regularisation = False
+                    # GeodesicFlow Implementation
                     is_regularisation_data = batch.get("is_regularisation_data", False)
-                    if is_regularisation_data and self.config.model_type == "lora":
-                        training_logger.debug("Predicting parent model residual.")
-                        handled_regularisation = True
-                        with torch.no_grad():
-                            if self.config.lora_type.lower() == "lycoris":
-                                training_logger.debug(
-                                    "Detaching LyCORIS adapter for parent prediction."
-                                )
-                                self.accelerator._lycoris_wrapped_network.restore()
-                            else:
-                                raise ValueError(
-                                    f"Cannot train parent-student networks on {self.config.lora_type} model. Only LyCORIS is supported."
-                                )
-                            target = self.model_predict(
-                                batch=batch,
-                                latents=latents,
-                                noisy_latents=noisy_latents,
-                                encoder_hidden_states=encoder_hidden_states,
-                                added_cond_kwargs=added_cond_kwargs,
-                                add_text_embeds=add_text_embeds,
-                                timesteps=timesteps_for_model,
-                            )
-                            if self.config.lora_type.lower() == "lycoris":
-                                training_logger.debug(
-                                    "Attaching LyCORIS adapter for student prediction."
-                                )
-                                self.accelerator._lycoris_wrapped_network.apply_to()
-
-                    # ================================================================================= #
-                    #                        GeodesicFlow Loss Calculation                              #
-                    # ================================================================================= #
-                    
-                    if self.config.flow_matching and self.config.geodesicflow_enabled:
-                        # 5. Get model predictions for both paths
-                        pred_geo_raw = self.model_predict(
-                            batch=batch, latents=latents, noisy_latents=z_t_geo.to(latents.dtype),
-                            encoder_hidden_states=encoder_hidden_states, added_cond_kwargs=added_cond_kwargs,
-                            add_text_embeds=add_text_embeds, timesteps=timesteps_for_model
-                        )
-                        # Project prediction to the tangent space for geometric correctness
-                        pred_geo = self._geodesicflow_project_to_tangent(pred_geo_raw, z_t_geo)
-
-                        pred_euc = self.model_predict(
-                            batch=batch, latents=latents, noisy_latents=z_t_euc.to(latents.dtype),
-                            encoder_hidden_states=encoder_hidden_states, added_cond_kwargs=added_cond_kwargs,
-                            add_text_embeds=add_text_embeds, timesteps=timesteps_for_model
-                        )
-
-                        # 6. Compute the adaptive blended loss
-                        loss_geo_per_pixel = F.mse_loss(pred_geo.float(), u_t_geo.float(), reduction='none')
-                        loss_euc_per_pixel = F.mse_loss(pred_euc.float(), u_t_euc.float(), reduction='none')
-
-                        loss_geo_per_sample = loss_geo_per_pixel.mean(dim=list(range(1, len(loss_geo_per_pixel.shape))))
-                        loss_euc_per_sample = loss_euc_per_pixel.mean(dim=list(range(1, len(loss_euc_per_pixel.shape))))
-
-                        # Squeeze lambda_val to match batch dimension
-                        blended_loss_per_sample = (1.0 - lambda_val.squeeze()) * loss_euc_per_sample + lambda_val.squeeze() * loss_geo_per_sample
+                    if self.config.geodesicflow_enabled and self.config.flow_matching and not is_regularisation_data:
+                        training_logger.debug("Using GeodesicFlow training method.")
+                        # Based on Algorithm 1: Training GeodesicFlow with Static Blending
                         
-                        loss = blended_loss_per_sample.mean()
-                        model_pred = pred_euc # Set for compatibility, not used in loss
-                    else:
+                        # Step 1: Normalize inputs to the hypersphere S^n
+                        # x0 is the data, x1 is the noise from a uniform distribution on the sphere
+                        x0 = F.normalize(latents.flatten(1), p=2, dim=1).view(latents.shape)
+                        x1 = F.normalize(noise.flatten(1), p=2, dim=1).view(noise.shape)
+                        
+                        # t is the interpolation factor, comes from sigmas
+                        t = sigmas.view(-1, 1, 1, 1)
+
+                        # --- Euclidean Path ---
+                        # Line 14: Compute z_t^euc
+                        z_t_euc = (1 - t) * x0 + t * x1
+                        # Line 15: Compute u_t^euc
+                        u_t_euc = x1 - x0
+                        
+                        # --- Geodesic Path ---
+                        # Line 9: Compute theta
+                        dot_product = (x0 * x1).sum(dim=[1, 2, 3], keepdim=True)
+                        dot_product = torch.clamp(dot_product, -1.0 + 1e-7, 1.0 - 1e-7) # for numerical stability
+                        theta = torch.acos(dot_product)
+                        
+                        # Line 10: Compute v0
+                        v0_numerator = x1 - dot_product * x0
+                        v0_denominator = torch.norm(v0_numerator, p=2, dim=[1, 2, 3], keepdim=True)
+                        # Add epsilon to avoid division by zero
+                        v0 = theta * v0_numerator / (v0_denominator + 1e-7)
+                        
+                        # Line 12: Compute z_t^geo (slerp)
+                        sin_theta = torch.sin(theta)
+                        # Add epsilon to avoid division by zero
+                        z_t_geo = (torch.sin((1 - t) * theta) / (sin_theta + 1e-7)) * x0 + \
+                                  (torch.sin(t * theta) / (sin_theta + 1e-7)) * x1
+                        # Renormalize to ensure we stay on the sphere after interpolation
+                        z_t_geo = F.normalize(z_t_geo.flatten(1), p=2, dim=1).view(z_t_geo.shape)
+
+                        # Line 13: Compute u_t^geo
+                        v0_dot_zt = (v0 * z_t_geo).sum(dim=[1, 2, 3], keepdim=True)
+                        # Add epsilon to avoid division by zero
+                        u_t_geo = v0 - (v0_dot_zt / (1 - dot_product**2 + 1e-7)) * (x1 - dot_product * x0)
+                        
+                        # --- Predict Velocities & Compute Loss ---
+                        # Line 16: Predict velocities
+                        common_pred_kwargs = {
+                            "batch": batch,
+                            "latents": latents,
+                            "encoder_hidden_states": encoder_hidden_states,
+                            "added_cond_kwargs": added_cond_kwargs,
+                            "add_text_embeds": add_text_embeds,
+                            "timesteps": timesteps,
+                        }
+
+                        hat_u_t_euc = self.model_predict(
+                            noisy_latents=z_t_euc.to(dtype=self.config.weight_dtype),
+                            **common_pred_kwargs
+                        )
+                        
+                        hat_u_t_geo = self.model_predict(
+                            noisy_latents=z_t_geo.to(dtype=self.config.weight_dtype),
+                            **common_pred_kwargs
+                        )
+
+                        # Line 17: Compute blended loss
+                        loss_euc = F.mse_loss(hat_u_t_euc.float(), u_t_euc.float())
+                        loss_geo = F.mse_loss(hat_u_t_geo.float(), u_t_geo.float())
+
+                        loss = (1.0 - self.config.geodesicflow_lambda) * loss_euc + \
+                               self.config.geodesicflow_lambda * loss_geo
+                        parent_loss = None
+
+                    else: # Original logic if GeodesicFlow is disabled or for regularization data
+                        if is_regularisation_data and self.config.model_type == "lora":
+                            training_logger.debug("Predicting parent model residual.")
+                            with torch.no_grad():
+                                if self.config.lora_type.lower() == "lycoris":
+                                    training_logger.debug(
+                                        "Detaching LyCORIS adapter for parent prediction."
+                                    )
+                                    self.accelerator._lycoris_wrapped_network.restore()
+                                else:
+                                    raise ValueError(
+                                        f"Cannot train parent-student networks on {self.config.lora_type} model. Only LyCORIS is supported."
+                                    )
+                                target = self.model_predict(
+                                    batch=batch,
+                                    latents=latents,
+                                    noisy_latents=noisy_latents,
+                                    encoder_hidden_states=encoder_hidden_states,
+                                    added_cond_kwargs=added_cond_kwargs,
+                                    add_text_embeds=add_text_embeds,
+                                    timesteps=timesteps,
+                                )
+                                if self.config.lora_type.lower() == "lycoris":
+                                    training_logger.debug(
+                                        "Attaching LyCORIS adapter for student prediction."
+                                    )
+                                    self.accelerator._lycoris_wrapped_network.apply_to()
+
                         training_logger.debug("Predicting noise residual.")
                         model_pred = self.model_predict(
                             batch=batch,
@@ -2509,106 +2480,84 @@ class Trainer:
                             encoder_hidden_states=encoder_hidden_states,
                             added_cond_kwargs=added_cond_kwargs,
                             add_text_embeds=add_text_embeds,
-                            timesteps=timesteps_for_model,
+                            timesteps=timesteps,
                         )
-                    
-                    # ================================================================================= #
-                    #                        End GeodesicFlow Loss Calculation                          #
-                    # ================================================================================= #
 
-                    # x-prediction requires that we now subtract the noise residual from the prediction to get the target sample.
-                    if (
-                        hasattr(self.noise_scheduler, "config")
-                        and hasattr(self.noise_scheduler.config, "prediction_type")
-                        and self.noise_scheduler.config.prediction_type == "sample"
-                    ):
-                        model_pred = model_pred - noise
-
-                    parent_loss = None
-
-                    # Compute the per-pixel loss without reducing over spatial dimensions
-                    if self.config.flow_matching and not self.config.geodesicflow_enabled:
-                        # For flow matching, compute the per-pixel squared differences
-                        loss = (
-                            model_pred.float() - target.float()
-                        ) ** 2  # Shape: (batch_size, C, H, W)
-                    elif self.config.geodesicflow_enabled:
-                        # Loss is already computed above
-                        pass
-                    elif self.config.snr_gamma is None or self.config.snr_gamma == 0:
-                        training_logger.debug("Calculating loss")
-                        loss = self.config.snr_weight * F.mse_loss(
-                            model_pred.float(), target.float(), reduction="none"
-                        )  # Shape: (batch_size, C, H, W)
-                    else:
-                        # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                        # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                        # This is discussed in Section 4.2 of the same paper.
-                        training_logger.debug("Using min-SNR loss")
-                        snr = compute_snr(timesteps, self.noise_scheduler)
-                        snr_divisor = snr
                         if (
-                            self.noise_scheduler.config.prediction_type
-                            == "v_prediction"
-                            or (
-                                self.config.flow_matching
-                                and self.config.flow_matching_loss == "diffusion"
-                            )
+                            hasattr(self.noise_scheduler, "config")
+                            and hasattr(self.noise_scheduler.config, "prediction_type")
+                            and self.noise_scheduler.config.prediction_type == "sample"
                         ):
-                            snr_divisor = snr + 1
+                            model_pred = model_pred - noise
 
-                        training_logger.debug(
-                            "Calculating MSE loss weights using SNR as divisor"
-                        )
-                        mse_loss_weights = (
-                            torch.stack(
-                                [
-                                    snr,
-                                    self.config.snr_gamma * torch.ones_like(timesteps),
-                                ],
-                                dim=1,
-                            ).min(dim=1)[0]
-                            / snr_divisor
-                        )  # Shape: (batch_size,)
+                        parent_loss = None
 
-                        # Compute the per-pixel MSE loss without reduction
-                        loss = F.mse_loss(
-                            model_pred.float(), target.float(), reduction="none"
-                        )  # Shape: (batch_size, C, H, W)
+                        if self.config.flow_matching:
+                            loss = (
+                                model_pred.float() - target.float()
+                            ) ** 2
+                        elif self.config.snr_gamma is None or self.config.snr_gamma == 0:
+                            training_logger.debug("Calculating loss")
+                            loss = self.config.snr_weight * F.mse_loss(
+                                model_pred.float(), target.float(), reduction="none"
+                            )
+                        else:
+                            training_logger.debug("Using min-SNR loss")
+                            snr = compute_snr(timesteps, self.noise_scheduler)
+                            snr_divisor = snr
+                            if (
+                                self.noise_scheduler.config.prediction_type == "v_prediction"
+                                or (
+                                    self.config.flow_matching
+                                    and self.config.flow_matching_loss == "diffusion"
+                                )
+                            ):
+                                snr_divisor = snr + 1
 
-                        # Reshape mse_loss_weights for broadcasting and apply to loss
-                        mse_loss_weights = mse_loss_weights.view(
-                            -1, 1, 1, 1
-                        )  # Shape: (batch_size, 1, 1, 1)
-                        loss = loss * mse_loss_weights  # Shape: (batch_size, C, H, W)
+                            training_logger.debug(
+                                "Calculating MSE loss weights using SNR as divisor"
+                            )
+                            mse_loss_weights = (
+                                torch.stack(
+                                    [
+                                        snr,
+                                        self.config.snr_gamma * torch.ones_like(timesteps),
+                                    ],
+                                    dim=1,
+                                ).min(dim=1)[0]
+                                / snr_divisor
+                            )
 
-                    # Mask the loss using any conditioning data
-                    conditioning_type = batch.get("conditioning_type")
-                    if conditioning_type == "mask":
-                        # Adapted from:
-                        # https://github.com/kohya-ss/sd-scripts/blob/main/library/custom_train_functions.py#L482
-                        mask_image = (
-                            batch["conditioning_pixel_values"]
-                            .to(dtype=loss.dtype, device=loss.device)[:, 0]
-                            .unsqueeze(1)
-                        )  # Shape: (batch_size, 1, H', W')
-                        mask_image = torch.nn.functional.interpolate(
-                            mask_image, size=loss.shape[2:], mode="area"
-                        )  # Resize to match loss spatial dimensions
-                        mask_image = mask_image / 2 + 0.5  # Normalize to [0,1]
-                        loss = loss * mask_image  # Element-wise multiplication
-                    
-                    if not (self.config.flow_matching and self.config.geodesicflow_enabled):
-                        # Reduce the loss by averaging over channels and spatial dimensions if not already done
+                            loss = F.mse_loss(
+                                model_pred.float(), target.float(), reduction="none"
+                            )
+
+                            mse_loss_weights = mse_loss_weights.view(
+                                -1, 1, 1, 1
+                            )
+                            loss = loss * mse_loss_weights
+
+                        conditioning_type = batch.get("conditioning_type")
+                        if conditioning_type == "mask":
+                            mask_image = (
+                                batch["conditioning_pixel_values"]
+                                .to(dtype=loss.dtype, device=loss.device)[:, 0]
+                                .unsqueeze(1)
+                            )
+                            mask_image = torch.nn.functional.interpolate(
+                                mask_image, size=loss.shape[2:], mode="area"
+                            )
+                            mask_image = mask_image / 2 + 0.5
+                            loss = loss * mask_image
+
                         loss = loss.mean(
                             dim=list(range(1, len(loss.shape)))
-                        )  # Shape: (batch_size,)
+                        )
 
-                        # Further reduce the loss by averaging over the batch dimension
-                        loss = loss.mean()  # Scalar value
+                        loss = loss.mean()
 
-                    if is_regularisation_data:
-                        parent_loss = loss
+                        if is_regularisation_data:
+                            parent_loss = loss
 
                     # Gather the losses across all processes for logging (if using distributed training)
                     avg_loss = self.accelerator.gather(
@@ -2732,11 +2681,10 @@ class Trainer:
                     self.timesteps_buffer = []
 
                     # Average out the luminance values of each batch, so that we can store that in this step.
-                    if len(training_luminance_values) > 0:
-                        avg_training_data_luminance = sum(training_luminance_values) / len(
-                            training_luminance_values
-                        )
-                        wandb_logs["train_luminance"] = avg_training_data_luminance
+                    avg_training_data_luminance = sum(training_luminance_values) / len(
+                        training_luminance_values
+                    )
+                    wandb_logs["train_luminance"] = avg_training_data_luminance
 
                     logger.debug(
                         f"Step {self.state['global_step']} of {self.config.max_train_steps}: loss {loss.item()}, lr {self.lr}, epoch {epoch}/{self.config.num_train_epochs}, ema_decay_value {ema_decay_value}, train_loss {self.train_loss}"
