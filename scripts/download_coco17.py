@@ -8,7 +8,7 @@ from datasets import load_dataset
 
 # Define the dataset name and the local directory to save the files
 dataset_name = "phiyodr/coco2017"
-local_dir = "/PHShome/yl535/project/python/datasets/coco17"
+local_dir = "/opt/dlami/nvme/datasets/coco17"
 
 # Load the dataset from Hugging Face
 dataset = load_dataset(dataset_name)

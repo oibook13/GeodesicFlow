@@ -13,6 +13,11 @@ Or
 conda env create -f environment.yml
 ```
 
+Or
+```
+./install.sh
+```
+
 ## Download Datasets
 ```angular2html
 python scripts/download_coco17.py
