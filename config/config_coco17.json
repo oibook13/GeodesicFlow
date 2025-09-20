@@ -17,7 +17,7 @@
     "--model_type": "lora",
     "--model_family": "sd3",
     "--pretrained_model_name_or_path": "stabilityai/stable-diffusion-3.5-large",
-    "--output_dir": "output_baseline_1/coco17_sd35_no_reweight",
+    "--output_dir": "/opt/dlami/nvme/output/output_baseline_1/coco17_sd35_no_reweight",
     "--tsaw_delta": 0.001,
     "--adabas_buffer_size": 1000,
     "--adabas_xi_minus": 0.3,

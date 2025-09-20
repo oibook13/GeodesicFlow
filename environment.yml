@@ -86,15 +86,15 @@ dependencies:
       - cffi==1.17.1
       - chardet==5.2.0
       - charset-normalizer==3.4.0
-      - clair==0.0.1
+      # - clair==0.0.1
       - cleo==2.1.0
       - click==8.1.7
-      - clip==1.0
+      # - clip==1.0
       - clip-interrogator==0.6.0
       - colorama==0.4.6
       - compel==2.0.3
       - contourpy==1.3.1
-      - controlnet-aux==0.0.9
+      # - controlnet-aux==0.0.9
       - crashtest==0.4.1
       - cryptography==43.0.3
       - cycler==0.12.1
@@ -196,24 +196,24 @@ dependencies:
       - nltk==3.9.1
       - numexpr==2.10.1
       - numpy==1.26.0
-      - nvidia-cublas-cu12==12.4.2.65
-      - nvidia-cuda-cupti-cu12==12.4.99
-      - nvidia-cuda-nvrtc-cu12==12.4.99
-      - nvidia-cuda-runtime-cu12==12.4.99
+      # - nvidia-cublas-cu12==12.4.2.65
+      # - nvidia-cuda-cupti-cu12==12.4.99
+      # - nvidia-cuda-nvrtc-cu12==12.4.99
+      # - nvidia-cuda-runtime-cu12==12.4.99
       - nvidia-cudnn-cu12==9.1.0.70
-      - nvidia-cufft-cu12==11.2.0.44
-      - nvidia-curand-cu12==10.3.5.119
-      - nvidia-cusolver-cu12==11.6.0.99
-      - nvidia-cusparse-cu12==12.3.0.142
-      - nvidia-nccl-cu12==2.20.5
+      # - nvidia-cufft-cu12==11.2.0.44
+      # - nvidia-curand-cu12==10.3.5.119
+      # - nvidia-cusolver-cu12==11.6.0.99
+      # - nvidia-cusparse-cu12==12.3.0.142
+      # - nvidia-nccl-cu12==2.20.5
       - nvidia-nvjitlink-cu12==12.4.99
-      - nvidia-nvtx-cu12==12.4.99
+      # - nvidia-nvtx-cu12==12.4.99
       - open-clip-torch==2.28.0
       - open-flamingo==0.0.2
       - openai==0.28.1
       - opencv-python==4.10.0.84
       - opencv-python-headless==4.11.0.86
-      - optimum-quanto==0.2.6.dev0
+      - optimum-quanto==0.2.6
       - orjson==3.10.15
       - packaging==24.1
       - pandas==2.2.3
@@ -298,14 +298,14 @@ dependencies:
       - tokenizers==0.20.1
       - toml==0.10.2
       - tomlkit==0.13.2
-      - torch==2.4.1+cu124
+      - torch==2.4.1
       - torch-fidelity==0.3.0
       - torch-optimi==0.2.1
-      - torchao==0.5.0+cu124
+      - torchao==0.5.0
       - torchaudio==2.4.1
       - torchmetrics==1.5.1
       - torchsde==0.2.6
-      - torchvision==0.19.1+cu124
+      - torchvision==0.19.1
       - tqdm==4.66.5
       - tqdm-multiprocess==0.0.11
       - trampoline==0.1.2
@@ -334,4 +334,4 @@ dependencies:
       - yarl==1.16.0
       - zipp==3.20.2
       - zstandard==0.23.0
-prefix: /shared/ssd_28T/home/yl535/anaconda3/envs/RiemannianRF
+prefix: /opt/dlami/nvme/miniconda3/envs/RiemannianRF

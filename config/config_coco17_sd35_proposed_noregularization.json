@@ -17,7 +17,7 @@
     "--model_type": "lora",
     "--model_family": "sd3",
     "--pretrained_model_name_or_path": "stabilityai/stable-diffusion-3.5-large",
-    "--output_dir": "output/coco17_sd35_proposed_noregularization",
+    "--output_dir": "/opt/dlami/nvme/output/coco17_sd35_proposed_noregularization",
     "--geodesicflow_alpha": 10,
     "--geodesicflow_beta": 5,
     "--geodesicflow_staticlambda": 0.5,
