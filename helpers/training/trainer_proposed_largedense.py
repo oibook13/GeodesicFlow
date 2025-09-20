@@ -2330,7 +2330,7 @@ class Trainer:
 
                         # 3. Compute density proxy and predict lambda
                         rho = torch.norm(u_t_geo, p=2, dim=1, keepdim=True)
-                        tilde_rho = 1.0 - rho / math.pi
+                        tilde_rho = rho / math.pi
                         # lambda_val = self.lambda_mlp(z_t_geo.detach())
 
                         z_t_geo_reshaped = z_t_geo.view(original_shape)
