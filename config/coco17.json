@@ -10,8 +10,8 @@
     "maximum_image_size": 512,
     "target_downsample_size": 512,
     "resolution_type": "pixel",
-    "cache_dir_vae": "cache/vae/sd3_ft/coco17",
-    "instance_data_dir": "/PHShome/yl535/project/python/datasets/coco17/train",
+    "cache_dir_vae": "/n/netscratch/kempner_undergrads/Lab/drakedu/GeodesicFlow/cache/vae/sd3_ft/coco17",
+    "instance_data_dir": "/n/netscratch/kempner_undergrads/Lab/drakedu/datasets/coco17/train",
     "disabled": false,
     "skip_file_discovery": "",
     "caption_strategy": "textfile",
@@ -23,7 +23,7 @@
     "type": "local",
     "dataset_type": "text_embeds",
     "default": true,
-    "cache_dir": "cache/text/sd3_ft/coco17",
+    "cache_dir": "/n/netscratch/kempner_undergrads/Lab/drakedu/GeodesicFlow/cache/text/sd3_ft/coco17",
     "disabled": false,
     "write_batch_size": 128
     }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-source activate base
-conda activate RiemannianRF
+module load python
+module load cuda
+source activate /n/netscratch/kempner_undergrads/Lab/drakedu/.conda/envs/RiemannianRF
 
 export TMPDIR="/tmp"
 export WANDB_TMP_DIR="$TMPDIR"
