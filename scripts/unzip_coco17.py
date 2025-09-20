@@ -3,20 +3,28 @@ from pathlib import Path, PurePosixPath
 from tqdm import tqdm
 import shutil
 
-ROOT = Path("/opt/dlami/nvme/datasets/coco17")
+ROOT = Path("/Users/henryhuang/Documents/4th Year/research/GeodesicFlow/datasets")
 ZIP_PATH = ROOT / "coco17_only_txt.zip"
 
 # Normalize any of these to canonical split names
 ALIASES = {
-    "train": "train", "train2014": "train", "train2017": "train",
-    "validation": "validation", "val": "validation", "val2014": "validation", "val2017": "validation",
-    "test": "test", "test2014": "test", "test2017": "test",
+    "train": "train",
+    "train2014": "train",
+    "train2017": "train",
+    "validation": "validation",
+    "val": "validation",
+    "val2014": "validation",
+    "val2017": "validation",
+    "test": "test",
+    "test2014": "test",
+    "test2017": "test",
 }
 
 # Prepare dirs
 ROOT.mkdir(parents=True, exist_ok=True)
 for s in ("train", "validation", "test", "_staging_txt"):
     (ROOT / s).mkdir(parents=True, exist_ok=True)
+
 
 def detect_split_from_parts(parts):
     """
@@ -29,12 +37,14 @@ def detect_split_from_parts(parts):
             return ALIASES[key]
     return None
 
+
 def safe_write_bytes(target: Path, src_fileobj):
     tmp = target.with_suffix(target.suffix + ".tmp")
     target.parent.mkdir(parents=True, exist_ok=True)
     with open(tmp, "wb") as dst:
         shutil.copyfileobj(src_fileobj, dst)
     tmp.replace(target)
+
 
 def extract_txts():
     extracted = {"train": 0, "validation": 0, "test": 0, "staged": 0, "skipped": 0}
@@ -62,6 +72,7 @@ def extract_txts():
                 extracted["staged"] += 1
     return extracted
 
+
 def build_jpg_indexes():
     """Return dict: split -> {stem set} and also a global stem->split map for resolving staged files."""
     jpg_index = {}
@@ -72,9 +83,14 @@ def build_jpg_indexes():
         jpg_index[split] = stems
         for s in stems:
             # If a stem appears in multiple splits (rare), prefer train > validation > test
-            if s not in stem_to_split or split == "train" or (stem_to_split[s] == "test" and split == "validation"):
+            if (
+                s not in stem_to_split
+                or split == "train"
+                or (stem_to_split[s] == "test" and split == "validation")
+            ):
                 stem_to_split[s] = split
     return jpg_index, stem_to_split
+
 
 def place_staged_txt(jpg_index, stem_to_split):
     """Move _staging_txt captions next to their JPG split; delete if no matching JPG anywhere."""
@@ -84,7 +100,7 @@ def place_staged_txt(jpg_index, stem_to_split):
         stem = txt.stem
         split = stem_to_split.get(stem)
         if split:
-            dest = (ROOT / split / f"{stem}.txt")
+            dest = ROOT / split / f"{stem}.txt"
             if dest.exists():
                 # already have one; treat staged as duplicate
                 txt.unlink(missing_ok=True)
@@ -106,6 +122,7 @@ def place_staged_txt(jpg_index, stem_to_split):
             txt.unlink(missing_ok=True)
             deleted += 1
     return moved, deleted
+
 
 def enforce_per_split(split, jpg_stems):
     """
@@ -134,6 +151,7 @@ def enforce_per_split(split, jpg_stems):
         kept += 1
     return kept, del_unmatched, del_dups
 
+
 def main():
     stats = extract_txts()
     print(f"Extracted: {stats}")
@@ -144,13 +162,16 @@ def main():
 
     for split in ("train", "validation", "test"):
         kept, del_unmatched, del_dups = enforce_per_split(split, jpg_index[split])
-        print(f"[{split}] kept={kept} del_unmatched={del_unmatched} del_dups={del_dups}")
+        print(
+            f"[{split}] kept={kept} del_unmatched={del_unmatched} del_dups={del_dups}"
+        )
 
     # Optional: clean up empty staging dir
     try:
         (ROOT / "_staging_txt").rmdir()
     except Exception:
         pass
+
 
 if __name__ == "__main__":
     main()

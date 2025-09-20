@@ -12,22 +12,26 @@ from tqdm import tqdm
 
 # --- NEW: image mode check ---
 from PIL import Image, ImageFile
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # tolerate slightly truncated files
 
 # --------- Config ----------
 dataset_name = "phiyodr/coco2017"
-local_dir = "/opt/dlami/nvme/datasets/coco17"
-max_workers = 64          # tune for your bandwidth / host
+local_dir = "/Users/henryhuang/Documents/4th Year/research/GeodesicFlow/datasets"
+max_workers = 64  # tune for your bandwidth / host
 connect_timeout = 10
 read_timeout = 60
-retries = 3               # automatic retry on transient errors
+retries = 3  # automatic retry on transient errors
 # ---------------------------
 
 # Make dirs
 Path(local_dir).mkdir(parents=True, exist_ok=True)
 
 # Load dataset
-dataset = load_dataset(dataset_name)  # keys usually: 'train', 'validation' (and maybe 'test')
+dataset = load_dataset(
+    dataset_name
+)  # keys usually: 'train', 'validation' (and maybe 'test')
+
 
 # Session with retries (shared across threads)
 def make_session() -> requests.Session:
@@ -36,7 +40,7 @@ def make_session() -> requests.Session:
         total=retries,
         backoff_factor=0.5,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(['GET', 'HEAD']),
+        allowed_methods=frozenset(["GET", "HEAD"]),
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
@@ -44,7 +48,9 @@ def make_session() -> requests.Session:
     sess.mount("https://", adapter)
     return sess
 
+
 SESSION = make_session()
+
 
 def safe_download(url: str, dest: Path) -> None:
     """Download to dest via temp file + atomic rename. Skips if exists."""
@@ -52,7 +58,9 @@ def safe_download(url: str, dest: Path) -> None:
         return
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     try:
-        with SESSION.get(url, stream=True, timeout=(connect_timeout, read_timeout)) as r:
+        with SESSION.get(
+            url, stream=True, timeout=(connect_timeout, read_timeout)
+        ) as r:
             r.raise_for_status()
             tmp.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp, "wb") as f:
@@ -68,6 +76,7 @@ def safe_download(url: str, dest: Path) -> None:
             tmp.unlink(missing_ok=True)
         # Don't re-raise; we just log and continue
 
+
 def is_rgb_image(path: Path) -> bool:
     """Return True if image opens successfully and is exactly mode 'RGB'."""
     try:
@@ -77,6 +86,7 @@ def is_rgb_image(path: Path) -> bool:
     except Exception as e:
         tqdm.write(f"[img open error] {path}: {e}")
         return False  # treat unreadable as not-RGB/bad
+
 
 def process_one(split_dir: Path, item: dict) -> str:
     """
@@ -122,7 +132,12 @@ def process_one(split_dir: Path, item: dict) -> str:
         return "error"
 
     # If we reached here and the file existed before, call it 'skipped'
-    return "skipped" if "downloaded" not in locals() and not (json_path.stat().st_size == 0) else "downloaded"
+    return (
+        "skipped"
+        if "downloaded" not in locals() and not (json_path.stat().st_size == 0)
+        else "downloaded"
+    )
+
 
 def run_split(split_name: str):
     split_dir = Path(local_dir) / split_name
@@ -132,7 +147,10 @@ def run_split(split_name: str):
 
     # Use a thread pool and submit per item
     results = {"downloaded": 0, "skipped": 0, "non_rgb_deleted": 0, "error": 0}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex, tqdm(total=total, desc=f"{split_name}", unit="img") as pbar:
+    with (
+        ThreadPoolExecutor(max_workers=max_workers) as ex,
+        tqdm(total=total, desc=f"{split_name}", unit="img") as pbar,
+    ):
         futures = (ex.submit(process_one, split_dir, ds_split[i]) for i in range(total))
         for fut in as_completed(futures):
             status = fut.result()
@@ -143,6 +161,7 @@ def run_split(split_name: str):
                 pbar.set_postfix(results)
     tqdm.write(f"[{split_name}] {results}")
 
+
 def main():
     # Ensure subdirs exist (only for splits we actually have)
     for split in dataset.keys():
@@ -152,6 +171,7 @@ def main():
         run_split(split)
 
     print("Dataset downloaded and organized successfully.")
+
 
 if __name__ == "__main__":
     main()
