@@ -334,4 +334,4 @@ dependencies:
       - yarl==1.16.0
       - zipp==3.20.2
       - zstandard==0.23.0
-prefix: /shared/ssd_28T/home/yl535/anaconda3/envs/RiemannianRF
+prefix: /n/netscratch/kempner_undergrads/Lab/drakedu/.conda/envs/RiemannianRF
