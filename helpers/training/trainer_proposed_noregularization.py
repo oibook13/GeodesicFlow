@@ -2330,7 +2330,7 @@ class Trainer:
 
                         # 3. Compute density proxy and predict lambda
                         rho = torch.norm(u_t_geo, p=2, dim=1, keepdim=True)
-                        tilde_rho = 1.0 - rho / math.pi
+                        tilde_rho = rho / math.pi
                         # lambda_val = self.lambda_mlp(z_t_geo.detach())
 
                         z_t_geo_reshaped = z_t_geo.view(original_shape)
@@ -2365,9 +2365,10 @@ class Trainer:
                         loss_euc = F.mse_loss(pred_euc.float(), u_t_euc.float(), reduction="none").mean(dim=1)
 
                         loss_adaptive = (1 - lambda_val.squeeze(1).float()) * loss_euc + lambda_val.squeeze(1).float() * loss_geo
-                        loss_lambda = F.mse_loss(lambda_val.float(), tilde_rho.float())
+                        # loss_lambda = F.mse_loss(lambda_val.float(), tilde_rho.float())
                         
-                        loss = loss_adaptive.mean() + self.config.geodesicflow_eta * loss_lambda
+                        # loss = loss_adaptive.mean() + self.config.geodesicflow_eta * loss_lambda
+                        loss = loss_adaptive.mean()
                         
                     # --- Original Logic ---
                     else:
@@ -2471,7 +2472,7 @@ class Trainer:
                     if grad_norm is not None: wandb_logs["grad_norm"] = grad_norm.item()
                     if self.config.geodesicflow_enabled:
                         wandb_logs["geodesicflow_loss_adaptive"] = loss_adaptive.mean().item()
-                        wandb_logs["geodesicflow_loss_lambda"] = loss_lambda.item()
+                        # wandb_logs["geodesicflow_loss_lambda"] = loss_lambda.item()
                         wandb_logs["geodesicflow_avg_lambda"] = lambda_val.mean().item()
 
                     progress_bar.update(1)

@@ -33,6 +33,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_base.env' CONFIG_JSO
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG_JSON_FILE='config/config_coco17_sd35_proposed.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed.sh
 CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG_JSON_FILE='config/config_coco17_sd35_proposed.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_staticlambda.sh
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG_JSON_FILE='config/config_coco17_sd35_proposed_largedense.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_largedense.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG_JSON_FILE='config/config_coco17_sd35_proposed_noregularization.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_noregularization.sh
 ```
 
 Flux.1.dev
@@ -42,6 +45,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_base.env' CONFIG_JSO
 CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_base.env' CONFIG_JSON_FILE='config/config_coco17_flux_rcfm.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_rcfm.sh
 CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG_JSON_FILE='config/config_coco17_flux_proposed.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed.sh
 CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG_JSON_FILE='config/config_coco17_flux_proposed.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_staticlambda.sh
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG_JSON_FILE='config/config_coco17_flux_proposed_largedense.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_largedense.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG_JSON_FILE='config/config_coco17_flux_proposed_noregularization.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_noregularization.sh
 ```
 
 
