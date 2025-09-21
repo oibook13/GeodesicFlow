@@ -11,17 +11,19 @@ IMAGE_HEIGHT=512
 
 PROMPT_DIR="/path/to/datasets/coco17/validation"
 PROMPT_DIR="/PHShome/yl535/project/python/datasets/coco17/validation"
-OUTPUT_DIR='generated_images_coco17'
+OUTPUT_DIR='generated_images_coco17_dynlambda_test'
 
 MODEL_PATH=(
             # 'output/coco17_proposed_GeodesicFlow_lambda_proxy_test/checkpoint-50'
-            'output/coco17_sd35_proposed_test/checkpoint-100'
+            # 'output/coco17_sd35_proposed_test/checkpoint-100'
+            # 'output/coco17_sd35_proposed/checkpoint-12000'
+            'output/coco17_sd35_proposed/checkpoint-12250'
             )
 NUM_PROMPTS_PER_RUN=1
 
 for (( i=0; i<${#MODEL_PATH[@]}; i++ ));
 do
-    python inference_sd3.5_proposed.py \
+    python inference_sd3.5_proposed_dynlambda.py \
     --prompt_dir=${PROMPT_DIR} \
     --model_path=${MODEL_PATH[$i]} \
     --output_dir=${OUTPUT_DIR} \

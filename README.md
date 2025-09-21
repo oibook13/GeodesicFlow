@@ -36,6 +36,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG_JSON_FILE='config/config_coco17_sd35_proposed_largedense.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_largedense.sh
 CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_proposed.env' CONFIG_JSON_FILE='config/config_coco17_sd35_proposed_noregularization.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_noregularization.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_base.env' CONFIG_JSON_FILE='config/config_coco17_sd35_proposed_nolearn_smalldense.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_nolearn_smalldense.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_base.env' CONFIG_JSON_FILE='config/config_coco17_sd35_proposed_nolearn_largedense.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_nolearn_largedense.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 CONFIG_ENV_FILE='config/config_base.env' CONFIG_JSON_FILE='config/config_coco17_sd35_proposed_onlymanifold.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_onlymanifold.sh
+
 ```
 
 Flux.1.dev
