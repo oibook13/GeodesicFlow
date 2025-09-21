@@ -16,7 +16,7 @@ import logging
 import shutil
 import json
 from safetensors import safe_open
-from safetensors.torch import save_file
+from safetensors.torch import save_file, load_file
 from tqdm import tqdm
 
 
@@ -196,8 +196,6 @@ class SaveHookManager:
         transformer_lora_layers_to_save = None
         text_encoder_1_lora_layers_to_save = None
         text_encoder_2_lora_layers_to_save = None
-        # Diffusers does not train the third text encoder.
-        # text_encoder_3_lora_layers_to_save = None
 
         for model in models:
             if isinstance(model, type(unwrap_model(self.accelerator, self.unet))):
@@ -228,7 +226,6 @@ class SaveHookManager:
             elif not self.use_deepspeed_optimizer:
                 raise ValueError(f"unexpected save model: {model.__class__}")
 
-            # make sure to pop weight so that corresponding model is not saved again
             if weights:
                 weights.pop()
 
@@ -262,10 +259,6 @@ class SaveHookManager:
             raise ValueError(f"unexpected model family: {self.args.model_family}")
 
     def _save_lycoris(self, models, weights, output_dir):
-        """
-        save wrappers for lycoris. For now, text encoders are not trainable
-        via lycoris.
-        """
         from helpers.publishing.huggingface import LORA_SAFETENSORS_FILENAME
 
         for _ in models:
@@ -282,7 +275,6 @@ class SaveHookManager:
             {"lycoris_config": json.dumps(lycoris_config)},  # metadata
         )
 
-        # copy the config into the repo
         shutil.copy2(
             self.args.lycoris_config, os.path.join(output_dir, "lycoris_config.json")
         )
@@ -290,7 +282,6 @@ class SaveHookManager:
         logger.info("LyCORIS weights have been saved to disk")
 
     def _save_full_model(self, models, weights, output_dir):
-        # Create a temporary directory for atomic saves
         temporary_dir = output_dir.replace("checkpoint", "temporary")
         os.makedirs(temporary_dir, exist_ok=True)
 
@@ -313,117 +304,52 @@ class SaveHookManager:
             )
             merge_safetensors_files(os.path.join(temporary_dir, sub_dir))
             if weights:
-                weights.pop()  # Pop the last weight
+                weights.pop()
 
-        # Copy contents of temporary directory to output directory
         for item in os.listdir(temporary_dir):
             s = os.path.join(temporary_dir, item)
             d = os.path.join(output_dir, item)
             if os.path.isdir(s):
-                shutil.copytree(s, d, dirs_exist_ok=True)  # Python 3.8+
+                shutil.copytree(s, d, dirs_exist_ok=True)
             else:
                 shutil.copy2(s, d)
 
-        # Remove the temporary directory
         shutil.rmtree(temporary_dir)
 
     def save_model_hook(self, models, weights, output_dir):
-        # Write "training_state.json" to the output directory containing the training state
         StateTracker.save_training_state(
             os.path.join(output_dir, self.training_state_path)
         )
         if not self.accelerator.is_main_process:
             return
+
+        # Find the index of LambdaMLP
+        lambda_mlp_idx = -1
+        for i, model in enumerate(models):
+            unwrapped_model = unwrap_model(self.accelerator, model)
+            if unwrapped_model.__class__.__name__ == 'LambdaMLP':
+                lambda_mlp_idx = i
+                break
+        
+        # If LambdaMLP is found, save it and remove it from the lists for default processing
+        if lambda_mlp_idx != -1:
+            lambda_mlp_model = models.pop(lambda_mlp_idx)
+            if weights is not None:
+                weights.pop(lambda_mlp_idx) # This is the key step to prevent accelerate from saving it
+            
+            unwrapped_lambda_mlp = unwrap_model(self.accelerator, lambda_mlp_model)
+            logger.info(f"Saving LambdaMLP state to {output_dir}/lambda_mlp.safetensors")
+            lambda_mlp_path = os.path.join(output_dir, "lambda_mlp.safetensors")
+            save_file(unwrapped_lambda_mlp.state_dict(), lambda_mlp_path)
+
+        # Now, `models` and `weights` lists no longer contain LambdaMLP.
+        # Proceed with the original logic which will pop the remaining weights.
         if "lora" in self.args.model_type and self.args.lora_type == "standard":
             self._save_lora(models=models, weights=weights, output_dir=output_dir)
-            return
         elif "lora" in self.args.model_type and self.args.lora_type == "lycoris":
             self._save_lycoris(models=models, weights=weights, output_dir=output_dir)
-            return
         else:
             self._save_full_model(models=models, weights=weights, output_dir=output_dir)
-
-    # def _load_lora(self, models, input_dir):
-    #     logger.info(f"Loading LoRA weights from Path: {input_dir}")
-    #     unet_ = None
-    #     transformer_ = None
-    #     denoiser = None
-    #     text_encoder_one_ = None
-    #     text_encoder_two_ = None
-
-    #     while len(models) > 0:
-    #         model = models.pop()
-
-    #         if isinstance(
-    #             unwrap_model(self.accelerator, model),
-    #             type(unwrap_model(self.accelerator, self.unet)),
-    #         ):
-    #             unet_ = model
-    #             denoiser = unet_
-    #         elif isinstance(
-    #             unwrap_model(self.accelerator, model),
-    #             type(unwrap_model(self.accelerator, self.transformer)),
-    #         ):
-    #             transformer_ = model
-    #             denoiser = transformer_
-    #         elif isinstance(
-    #             unwrap_model(self.accelerator, model),
-    #             type(unwrap_model(self.accelerator, self.text_encoder_1)),
-    #         ):
-    #             text_encoder_one_ = model
-    #         elif isinstance(
-    #             unwrap_model(self.accelerator, model),
-    #             type(unwrap_model(self.accelerator, self.text_encoder_2)),
-    #         ):
-    #             text_encoder_two_ = model
-    #         else:
-    #             raise ValueError(
-    #                 f"unexpected save model: {model.__class__}"
-    #                 f"\nunwrapped: {unwrap_model(self.accelerator, model).__class__}"
-    #                 f"\nunet: {unwrap_model(self.accelerator, self.unet).__class__}"
-    #             )
-
-    #     if self.args.model_family in ["sd3", "flux", "pixart_sigma"]:
-    #         key_to_replace = "transformer"
-    #         lora_state_dict = self.pipeline_class.lora_state_dict(input_dir)
-    #     else:
-    #         key_to_replace = "unet"
-    #         lora_state_dict, _ = self.pipeline_class.lora_state_dict(input_dir)
-
-    #     denoiser_state_dict = {
-    #         f'{k.replace(f"{key_to_replace}.", "")}': v
-    #         for k, v in lora_state_dict.items()
-    #         if k.startswith(f"{key_to_replace}.")
-    #     }
-    #     denoiser_state_dict = convert_unet_state_dict_to_peft(denoiser_state_dict)
-    #     incompatible_keys = set_peft_model_state_dict(
-    #         denoiser, denoiser_state_dict, adapter_name="default"
-    #     )
-
-    #     if incompatible_keys is not None:
-    #         # check only for unexpected keys
-    #         unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-    #         if unexpected_keys:
-    #             logger.warning(
-    #                 f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
-    #                 f" {unexpected_keys}. "
-    #             )
-
-    #     if self.args.train_text_encoder:
-    #         # Do we need to call `scale_lora_layers()` here?
-    #         _set_state_dict_into_text_encoder(
-    #             lora_state_dict,
-    #             prefix="text_encoder.",
-    #             text_encoder=text_encoder_one_,
-    #         )
-
-    #         _set_state_dict_into_text_encoder(
-    #             lora_state_dict,
-    #             prefix="text_encoder_2.",
-    #             text_encoder=text_encoder_two_,
-    #         )
-
-    #     logger.info("Completed loading LoRA weights.")
 
     def _load_lora(self, models, input_dir):
         logger.info(f"Loading LoRA weights from Path: {input_dir}")
@@ -433,54 +359,25 @@ class SaveHookManager:
         text_encoder_one_ = None
         text_encoder_two_ = None
 
-        # Create a copy of the models list to iterate safely, as models.pop() modifies it.
-        # This is important if `models` is shared or expected to be in its original state elsewhere.
-        # However, the original code uses pop(), implying it expects to consume the list.
-        # Let's stick to the pop() pattern but make it robust.
-        models_to_process = models[:] # Create a shallow copy to iterate and pop from the original
+        while len(models) > 0:
+            model = models.pop()
 
-        while len(models_to_process) > 0:
-            model = models_to_process.pop(0) # Pop from the beginning to maintain relative order if desired
-
-            # Unwrap the model to get its base class
-            unwrapped_model = unwrap_model(self.accelerator, model)
-
-            # Check if the unwrapped model is one of the expected types for LoRA
-            if isinstance(unwrapped_model, UNet2DConditionModel):
+            if self.unet is not None and isinstance(unwrap_model(self.accelerator, model), type(unwrap_model(self.accelerator, self.unet))):
                 unet_ = model
                 denoiser = unet_
-            elif isinstance(unwrapped_model, (FluxTransformer2DModel, SD3Transformer2DModel, PixArtTransformer2DModel, HunyuanDiT2DModel)):
+            elif self.transformer is not None and isinstance(unwrap_model(self.accelerator, model), type(unwrap_model(self.accelerator, self.transformer))):
                 transformer_ = model
                 denoiser = transformer_
-            elif isinstance(unwrapped_model, CLIPTextModel): # Assuming CLIPTextModel is the base for text encoders
-                # Distinguish between text_encoder_1 and text_encoder_2 if both exist
-                if self.text_encoder_1 is not None and unwrapped_model is unwrap_model(self.accelerator, self.text_encoder_1):
-                    text_encoder_one_ = model
-                elif self.text_encoder_2 is not None and unwrapped_model is unwrap_model(self.accelerator, self.text_encoder_2):
-                    text_encoder_two_ = model
-                else:
-                    logger.warning(f"Skipping unexpected text encoder model during LoRA load: {unwrapped_model.__class__}")
-            elif isinstance(unwrapped_model, nn.Sequential): # Explicitly handle nn.Sequential (a_phi, b_phi)
-                logger.warning(f"Skipping nn.Sequential model (likely a_phi or b_phi) during LoRA load: {unwrapped_model.__class__}")
+            elif self.text_encoder_1 is not None and isinstance(unwrap_model(self.accelerator, model), type(unwrap_model(self.accelerator, self.text_encoder_1))):
+                text_encoder_one_ = model
+            elif self.text_encoder_2 is not None and isinstance(unwrap_model(self.accelerator, model), type(unwrap_model(self.accelerator, self.text_encoder_2))):
+                text_encoder_two_ = model
             else:
-                # This is the catch-all for any other unexpected model types.
-                # Instead of raising an error, log a warning and skip.
-                logger.warning(
-                    f"Skipping unexpected model type during LoRA load: {unwrapped_model.__class__}"
-                    f"\nmodel: {model.__class__}"
-                    f"\nunwrapped: {unwrapped_model.__class__}"
-                    f"\nExpected unet type: {type(unwrap_model(self.accelerator, self.unet))}"
-                    f"\nExpected transformer type: {type(unwrap_model(self.accelerator, self.transformer))}"
-                    f"\nExpected text encoder type: {type(unwrap_model(self.accelerator, self.text_encoder_1))}"
+                raise ValueError(
+                    f"unexpected save model: {model.__class__}\n"
+                    f"unwrapped: {unwrap_model(self.accelerator, model).__class__}\n"
+                    f"unet: {type(unwrap_model(self.accelerator, self.unet)) if self.unet else 'None'}"
                 )
-            # No `else` block to raise an error, so unexpected models are skipped.
-
-        if denoiser is None:
-            logger.error("No denoiser model (U-Net or Transformer) found for LoRA loading.")
-            # Depending on your desired behavior, you might want to raise an error here
-            # if a denoiser is absolutely mandatory for LoRA.
-            # For now, we'll proceed and let subsequent code handle if denoiser is None.
-            return # Exit if no denoiser was found to load LoRA into
 
         if self.args.model_family in ["sd3", "flux", "pixart_sigma"]:
             key_to_replace = "transformer"
@@ -500,37 +397,32 @@ class SaveHookManager:
         )
 
         if incompatible_keys is not None:
-            # check only for unexpected keys
             unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
             if unexpected_keys:
                 logger.warning(
-                    f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
-                    f" {unexpected_keys}. "
+                    f"Loading adapter weights led to unexpected keys not found in the model: {unexpected_keys}."
                 )
 
         if self.args.train_text_encoder:
-            # Do we need to call `scale_lora_layers()` here?
-            if text_encoder_one_ is not None:
-                _set_state_dict_into_text_encoder(
-                    lora_state_dict,
-                    prefix="text_encoder.",
-                    text_encoder=text_encoder_one_,
-                )
+            _set_state_dict_into_text_encoder(
+                lora_state_dict,
+                prefix="text_encoder.",
+                text_encoder=text_encoder_one_,
+            )
 
-            if text_encoder_two_ is not None:
-                _set_state_dict_into_text_encoder(
-                    lora_state_dict,
-                    prefix="text_encoder_2.",
-                    text_encoder=text_encoder_two_,
-                )
+            _set_state_dict_into_text_encoder(
+                lora_state_dict,
+                prefix="text_encoder_2.",
+                text_encoder=text_encoder_two_,
+            )
 
         logger.info("Completed loading LoRA weights.")
 
     def _load_lycoris(self, models, input_dir):
         from helpers.publishing.huggingface import LORA_SAFETENSORS_FILENAME
-
+        
         while len(models) > 0:
-            model = models.pop()
+            models.pop()
 
         state = self.accelerator._lycoris_wrapped_network.load_weights(
             os.path.join(input_dir, LORA_SAFETENSORS_FILENAME)
@@ -551,7 +443,6 @@ class SaveHookManager:
             raise ValueError("No model found to load LyCORIS weights into.")
 
         logger.info("LyCORIS weights have been loaded from disk")
-        # disable LyCORIS spam logging
         lycoris_logger = logging.getLogger("LyCORIS")
         lycoris_logger.setLevel(logging.ERROR)
 
@@ -567,7 +458,6 @@ class SaveHookManager:
             return_exception = False
             for i in range(len(models)):
                 try:
-                    # pop models so that they are not loaded again
                     model = models.pop()
                     load_model = self.denoiser_class.from_pretrained(
                         input_dir, subfolder=self.denoiser_subdir
@@ -586,7 +476,6 @@ class SaveHookManager:
                     del load_model
                 except Exception as e:
                     import traceback
-
                     return_exception = f"Could not load model: {e}, traceback: {traceback.format_exc()}"
 
             if return_exception:
@@ -609,9 +498,30 @@ class SaveHookManager:
             logger.warning(
                 f"Could not find {training_state_path} in checkpoint dir {input_dir}"
             )
+
+        # --- Start of Correction ---
+        
+        # Identify LambdaMLP and other models to load with the custom logic.
+        models_to_load_customly = []
+        models_to_keep_for_accelerate = [] # Should be empty in your LoRA case, but good practice
+
+        for model in models:
+            unwrapped_model = unwrap_model(self.accelerator, model)
+            if unwrapped_model.__class__.__name__ == 'LambdaMLP':
+                logger.info("Ignoring LambdaMLP in load_model_hook as requested.")
+                # Do not add it to any list, effectively removing it.
+            else:
+                models_to_load_customly.append(model)
+                
+                
+        # Now, process the models that need custom loading.
         if "lora" in self.args.model_type and self.args.lora_type == "standard":
-            self._load_lora(models=models, input_dir=input_dir)
+            self._load_lora(models=models_to_load_customly, input_dir=input_dir)
         elif "lora" in self.args.model_type and self.args.lora_type == "lycoris":
-            self._load_lycoris(models=models, input_dir=input_dir)
+            self._load_lycoris(models=models_to_load_customly, input_dir=input_dir)
         else:
-            self._load_full_model(models=models, input_dir=input_dir)
+            self._load_full_model(models=models_to_load_customly, input_dir=input_dir)
+            
+        # **Crucially, clear the original `models` list** so accelerate knows these are handled.
+        # The models were already used/popped inside the _load_* functions. This just cleans up.
+        models.clear()

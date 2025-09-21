@@ -24,7 +24,8 @@ MODEL_PATH=(
             # 'output/coco17_proposed_RCFM/checkpoint-24000'
             # 'output/coco17_proposed_sd35_RCFM_lr1e-4/checkpoint-26000'
             # 'output/coco17_proposed_sd35_RCFM_lr1e-4/checkpoint-24000'
-            'output/coco17_flux_lr1e-6/checkpoint-14000'
+            # 'output/coco17_flux_lr1e-6/checkpoint-14000'
+            'output/coco17_sd35_proposed_test/checkpoint-350'
             )
 NUM_PROMPTS_PER_RUN=1
 
