@@ -1,12 +1,6 @@
 import os
-from accelerate.logging import get_logger
 import accelerate
 import torch
-
-logger = get_logger(__name__, log_level=os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO"))
-
-target_level = os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO")
-logger.setLevel(target_level)
 
 is_optimi_available = False
 from helpers.training.optimizers.adamw_bfloat16 import AdamWBF16
@@ -26,23 +20,29 @@ try:
         AdamWFp8 as AOAdamWFp8,
         CPUOffloadOptimizer as AOCPUOffloadOptimizer,
     )
+    torchao_available = True
 
     if torch.backends.mps.is_available():
         import torch._dynamo
 
         torch._dynamo.config.suppress_errors = True
 except Exception as e:
-    print("You need torchao installed for its low-precision optimizers.")
-    raise e
+    print(f"Warning: torchao low-precision optimizers not available: {e}")
+    # Define dummy classes as fallbacks
+    AOAdamW8Bit = None
+    AOAdamW4Bit = None
+    AOAdamFp8 = None
+    AOAdamWFp8 = None
+    AOCPUOffloadOptimizer = None
+    torchao_available = False
 
 try:
     import optimi
 
     is_optimi_available = True
 except:
-    logger.error(
-        "Could not load optimi library. Please install `torch-optimi` for better memory efficiency."
-    )
+    print("Warning: Could not load optimi library. Please install `torch-optimi` for better memory efficiency.")
+    is_optimi_available = False
 
 is_bitsandbytes_available = False
 try:
@@ -51,9 +51,7 @@ try:
     is_bitsandbytes_available = True
 except:
     if torch.cuda.is_available():
-        logger.warning(
-            "Could not load bitsandbytes library. BnB-specific optimisers and other functionality will be unavailable."
-        )
+        print("Warning: Could not load bitsandbytes library. BnB-specific optimisers and other functionality will be unavailable.")
 
 optimizer_choices = {
     "adamw_bf16": {
@@ -587,19 +585,15 @@ def determine_optimizer_class_with_config(
         default_settings = extra_optimizer_args
         optimizer_details = {}
     elif is_quantized and not enable_adamw_bf16:
-        logger.error(
-            f"When --base_model_default_dtype=fp32, AdamWBF16 may not be used. Switching to AdamW."
-        )
+        print("Error: When --base_model_default_dtype=fp32, AdamWBF16 may not be used. Switching to AdamW.")
         optimizer_class, optimizer_details = optimizer_parameters("optimi-adamw", args)
     else:
         optimizer_class, optimizer_details = optimizer_parameters(args.optimizer, args)
         default_settings = optimizer_details.get("default_settings")
     if optimizer_details.get("can_warmup", False):
-        logger.info(
-            f"Optimizer contains LR scheduler, warmup steps will be set to {args.lr_warmup_steps}."
-        )
+        print(f"Info: Optimizer contains LR scheduler, warmup steps will be set to {args.lr_warmup_steps}.")
         default_settings["warmup_steps"] = args.lr_warmup_steps
-    logger.info(f"cls: {optimizer_class}, settings: {default_settings}")
+    print(f"Info: cls: {optimizer_class}, settings: {default_settings}")
     return default_settings, optimizer_class
 
 

@@ -139,11 +139,16 @@ def process_one(split_dir: Path, item: dict) -> str:
     )
 
 
-def run_split(split_name: str):
+def run_split(split_name: str, limit: int = None):
     split_dir = Path(local_dir) / split_name
     split_dir.mkdir(parents=True, exist_ok=True)
     ds_split = dataset[split_name]
     total = len(ds_split)
+
+    # Limit the number of images for testing (TESTING MODE)
+    if limit:
+        total = min(total, limit)
+        print(f"[TESTING MODE] Limiting {split_name} to {total} images")
 
     # Use a thread pool and submit per item
     results = {"downloaded": 0, "skipped": 0, "non_rgb_deleted": 0, "error": 0}
@@ -157,13 +162,20 @@ def run_split(split_name: str):
             results[status] = results.get(status, 0) + 1
             pbar.update(1)
             # Optional: show occasional stats
-            if (pbar.n % 1000) == 0:
+            if (pbar.n % 100) == 0:  # Show stats more frequently for small datasets
                 pbar.set_postfix(results)
     tqdm.write(f"[{split_name}] {results}")
 
 
 def main():
-    print(f"Downloading COCO17 dataset to Modal volume: {local_dir}")
+    # TESTING MODE: Download only 100 images per split
+    TESTING_MODE = True
+    TESTING_LIMIT = 50  # 50 training + 50 validation = 100 total
+
+    if TESTING_MODE:
+        print(f"[TESTING MODE] Downloading only {TESTING_LIMIT} images per split to Modal volume: {local_dir}")
+    else:
+        print(f"Downloading full COCO17 dataset to Modal volume: {local_dir}")
 
     # Ensure subdirs exist (only for splits we actually have)
     for split in dataset.keys():
@@ -171,7 +183,10 @@ def main():
 
     for split in dataset.keys():
         print(f"Processing split: {split}")
-        run_split(split)
+        if TESTING_MODE:
+            run_split(split, limit=TESTING_LIMIT)
+        else:
+            run_split(split)
 
     print("Dataset downloaded and organized successfully.")
 

@@ -20,7 +20,7 @@ cache_volume = modal.Volume.from_name("geodesicflow-cache", create_if_missing=Tr
 
 # Create the Modal image with CUDA 12.2 and conda environment
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04")
+    modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04")
     .apt_install(
         [
             "wget",
@@ -33,27 +33,47 @@ image = (
             "lsb-release",
             "unzip",
             "vim",
+            "python3-dev",
+            "python3-pip",
+            "gcc",
+            "g++",
+            "pkg-config",
+            "libssl-dev",
         ]
     )
     .run_commands(
         [
+            # Create python symlink for pip_install compatibility
+            "ln -sf /usr/bin/python3 /usr/bin/python",
+            # Install Rust for tokenizers compilation
+            "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
+            "echo 'export PATH=\"/root/.cargo/bin:$PATH\"' >> /root/.bashrc",
             # Install miniconda
             "wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh",
             "bash /tmp/miniconda.sh -b -p /opt/miniconda",
             "rm /tmp/miniconda.sh",
             "ln -s /opt/miniconda/bin/conda /usr/local/bin/conda",
             "/opt/miniconda/bin/conda init bash",
+            # Accept conda Terms of Service
+            "/opt/miniconda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main || true",
+            "/opt/miniconda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r || true",
         ]
     )
     .env(
         {
-            "PATH": "/opt/miniconda/bin:$PATH",
+            "PATH": "/root/.cargo/bin:/opt/miniconda/bin:$PATH",
             "CUDA_HOME": "/usr/local/cuda",
             "TOKENIZERS_PARALLELISM": "false",
         }
     )
     .workdir("/app")
-    .add_local_dir(".", "/app")  # Must be last in build chain
+    .add_local_dir(".", "/app", copy=True)  # Copy files into image for build steps
+    .run_commands([
+        # Create simplified conda environment with just Python and CUDA tools
+        "/opt/miniconda/bin/conda create -n RiemannianRF python=3.11 -y",
+        # Install conda packages only (skip pip dependencies for faster build)
+        "/opt/miniconda/bin/conda install -n RiemannianRF -c nvidia -c defaults cuda-toolkit=12.6 -y"
+    ])
 )
 
 
@@ -92,6 +112,73 @@ def test_gpu_access():
         print(f"nvidia-smi error: {e}")
 
     return "GPU test completed"
+
+
+@app.function(
+    image=image,
+    timeout=300,  # 5 minutes
+)
+def test_conda_environment():
+    """Test conda environment setup and package imports"""
+    import subprocess
+    import os
+
+    print("=== Conda Environment Test Results ===")
+
+    # Check if conda is available
+    conda_result = subprocess.run(["/opt/miniconda/bin/conda", "--version"], capture_output=True, text=True)
+    if conda_result.returncode == 0:
+        print(f"✓ Conda version: {conda_result.stdout.strip()}")
+    else:
+        print("✗ Conda not available")
+        return "Conda not available"
+
+    # List available environments
+    env_list = subprocess.run(["/opt/miniconda/bin/conda", "env", "list"], capture_output=True, text=True)
+    print("Available conda environments:")
+    print(env_list.stdout)
+
+    # Check if RiemannianRF environment exists
+    conda_python = "/opt/miniconda/envs/RiemannianRF/bin/python"
+    if os.path.exists(conda_python):
+        print("✓ RiemannianRF environment found")
+
+        # Test critical package imports
+        test_packages = [
+            "torch",
+            "torchvision",
+            "torchao",
+            "transformers",
+            "accelerate",
+            "bitsandbytes",
+            "diffusers",
+            "numpy",
+            "tokenizers"
+        ]
+
+        print("Testing package imports in conda environment:")
+        all_successful = True
+        for package in test_packages:
+            result = subprocess.run(
+                [conda_python, "-c", f"import {package}; print(f'✓ {package} {{getattr({package}, \"__version__\", \"unknown\")}}')"],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                print(result.stdout.strip())
+            else:
+                print(f"✗ {package} import failed: {result.stderr.strip()}")
+                all_successful = False
+
+        if all_successful:
+            print("✓ All package imports successful!")
+            return "Conda environment test passed"
+        else:
+            print("✗ Some package imports failed")
+            return "Some packages missing in conda environment"
+    else:
+        print("✗ RiemannianRF environment not found")
+        return "RiemannianRF environment not found"
 
 
 @app.function(
@@ -144,7 +231,8 @@ def upload_text_zip_file():
 
 @app.function(
     image=image,
-    gpu="H100:8",
+    cpu=4.0,  # Use CPU only - dataset download doesn't need GPU
+    memory=8192,  # 8GB RAM for downloading
     volumes={
         "/datasets": datasets_volume,
         "/checkpoints": checkpoints_volume,
@@ -160,44 +248,112 @@ def download_dataset():
     import os
     from pathlib import Path
 
-    # Accept conda Terms of Service first
-    print("Accepting conda Terms of Service...")
-    tos_commands = [
-        [
-            "/opt/miniconda/bin/conda",
-            "tos",
-            "accept",
-            "--override-channels",
-            "--channel",
-            "https://repo.anaconda.com/pkgs/main",
-        ],
-        [
-            "/opt/miniconda/bin/conda",
-            "tos",
-            "accept",
-            "--override-channels",
-            "--channel",
-            "https://repo.anaconda.com/pkgs/r",
-        ],
-    ]
+    # Conda environment should already be created during image building
+    print("Setting up conda environment for download...")
 
-    for cmd in tos_commands:
-        subprocess.run(cmd, capture_output=True, text=True)
-
-    # Create conda environment from the copied environment.yml
-    print("Setting up conda environment...")
-    env_setup = subprocess.run(
-        ["/opt/miniconda/bin/conda", "env", "create", "-f", "/app/environment.yml"],
+    # Check if the RiemannianRF environment exists
+    env_check = subprocess.run(
+        ["/opt/miniconda/bin/conda", "env", "list"],
         capture_output=True,
         text=True,
     )
 
-    if env_setup.returncode != 0:
-        print(f"Conda environment setup output: {env_setup.stdout}")
-        print(f"Conda environment setup error: {env_setup.stderr}")
-        print("Environment creation failed, falling back to base conda python")
+    if "RiemannianRF" in env_check.stdout:
+        print("✓ RiemannianRF conda environment found")
+
+        # Install pip packages from environment.yml into the conda environment
+        print("Installing pip packages into conda environment...")
+        conda_python = "/opt/miniconda/envs/RiemannianRF/bin/python"
+        conda_pip = "/opt/miniconda/envs/RiemannianRF/bin/pip"
+
+        # Install typing_extensions FIRST to ensure it's available for PyTorch
+        print("Installing typing_extensions (critical dependency)...")
+        typing_result = subprocess.run(
+            [conda_pip, "install", "typing_extensions>=4.8.0"],
+            capture_output=True,
+            text=True
+        )
+        if typing_result.returncode == 0:
+            print("✓ typing_extensions installed successfully")
+        else:
+            print(f"✗ typing_extensions installation failed: {typing_result.stderr[:200]}...")
+
+        # Install base dependencies
+        print("Installing base dependencies...")
+        base_packages = [
+            "wheel>=0.40.0",
+            "setuptools>=65.0.0",
+            "packaging>=21.0",
+            "six>=1.16.0",
+            "numpy>=1.24.0",
+            "requests>=2.32.0",
+            "urllib3>=2.0.0",
+            "certifi>=2024.0.0",
+            "idna>=3.7",
+            "charset-normalizer>=3.3.0"
+        ]
+
+        for package in base_packages:
+            pkg_name = package.split('>=')[0].split('==')[0]
+            print(f"Installing {pkg_name}...")
+            install_result = subprocess.run(
+                [conda_pip, "install", package],
+                capture_output=True,
+                text=True
+            )
+            if install_result.returncode == 0:
+                print(f"✓ Installed {pkg_name}")
+            else:
+                print(f"✗ Failed to install {pkg_name}: {install_result.stderr[:100]}...")
+
+        # Install PyTorch with CUDA support (after typing_extensions)
+        print("Installing PyTorch 2.4.1 with CUDA 12.1...")
+        torch_result = subprocess.run(
+            [conda_pip, "install", "torch==2.4.1", "torchvision==0.19.1", "--index-url", "https://download.pytorch.org/whl/cu121"],
+            capture_output=True,
+            text=True
+        )
+        if torch_result.returncode == 0:
+            print("✓ PyTorch 2.4.1 installed successfully")
+        else:
+            print(f"✗ PyTorch installation failed: {torch_result.stderr[:200]}...")
+
+        # Install ML packages that depend on PyTorch
+        print("Installing ML packages...")
+        ml_packages = [
+            "datasets>=2.0.0",
+            "huggingface-hub>=0.24.0",
+            "tokenizers>=0.19.0",
+            "transformers>=4.44.0",
+            "torchao==0.5.0",
+            "tqdm>=4.60.0",
+            "pandas>=1.5.0",
+            "Pillow>=10.0.0",
+            "filelock>=3.12.0",
+            "pyyaml>=6.0",
+            "fsspec>=2023.1.0",
+            "pyarrow>=12.0.0",
+            "colorama>=0.4.6",
+            "protobuf>=3.20.0"
+        ]
+
+        for package in ml_packages:
+            pkg_name = package.split('>=')[0].split('==')[0]
+            print(f"Installing {pkg_name}...")
+            install_result = subprocess.run(
+                [conda_pip, "install", package],
+                capture_output=True,
+                text=True
+            )
+            if install_result.returncode == 0:
+                print(f"✓ Installed {pkg_name}")
+            else:
+                print(f"✗ Failed to install {pkg_name}: {install_result.stderr[:100]}...")
+
     else:
-        print("Conda environment created successfully")
+        print("✗ RiemannianRF conda environment not found")
+        print("Available environments:")
+        print(env_check.stdout)
 
     # Update the dataset download script to use Modal volumes
     script_path = "/app/scripts/download_coco17_modal.py"
@@ -213,29 +369,39 @@ def download_dataset():
         val_count = len(list(val_images.glob("*.jpg")))
         print(f"Dataset already exists: {train_count} training images, {val_count} validation images")
 
-        # Still check for text files
-        zip_path = dataset_path / "coco17_only_txt.zip"
-        if zip_path.exists():
-            print(f"Text zip also exists ({zip_path.stat().st_size} bytes)")
-            return "Dataset already exists - skipping download"
-        else:
-            print("Images exist but text zip missing - will download text files only")
+        # For testing mode, we expect small numbers
+        if train_count > 0 and val_count > 0:
+            print("Found existing dataset, checking if we should re-download...")
+            # If we have some images, skip download unless explicitly requested
+            zip_path = dataset_path / "coco17_only_txt.zip"
+            if zip_path.exists():
+                print(f"Text zip also exists ({zip_path.stat().st_size} bytes)")
+                return "Dataset already exists - skipping download"
+            else:
+                print("Images exist but text zip missing - will download text files only")
 
     print("Starting COCO17 dataset download...")
 
-    # Try conda environment python first, fallback to base conda python
+    # Use conda environment python - it should exist now
     conda_python = "/opt/miniconda/envs/RiemannianRF/bin/python"
-    base_python = "/opt/miniconda/bin/python"
 
     if os.path.exists(conda_python):
         python_cmd = conda_python
-        print("Using conda environment python")
-    elif os.path.exists(base_python):
-        python_cmd = base_python
-        print("Using base conda python")
+        print("✓ Using conda environment python")
+
+        # Test import in conda environment
+        test_result = subprocess.run(
+            [conda_python, "-c", "import torchao; print('✓ torchao available in conda environment')"],
+            capture_output=True,
+            text=True,
+        )
+        if test_result.returncode == 0:
+            print(test_result.stdout.strip())
+        else:
+            print(f"✗ torchao not available in conda environment: {test_result.stderr.strip()}")
     else:
-        python_cmd = sys.executable
-        print("Using system python")
+        print("✗ Conda environment python not found, falling back to base")
+        python_cmd = "/opt/miniconda/bin/python"
 
     result = subprocess.run([python_cmd, script_path], capture_output=True, text=True)
 
@@ -293,7 +459,7 @@ def download_dataset():
 
 @app.function(
     image=image,
-    gpu="H100:8",
+    gpu="A100:1",  # Switch to 1 A100 for testing
     volumes={
         "/datasets": datasets_volume,
         "/checkpoints": checkpoints_volume,
@@ -308,130 +474,237 @@ def train_model():
     import os
     import shutil
 
-    # Accept conda Terms of Service first
-    print("Accepting conda Terms of Service...")
-    tos_commands = [
-        [
-            "/opt/miniconda/bin/conda",
-            "tos",
-            "accept",
-            "--override-channels",
-            "--channel",
-            "https://repo.anaconda.com/pkgs/main",
-        ],
-        [
-            "/opt/miniconda/bin/conda",
-            "tos",
-            "accept",
-            "--override-channels",
-            "--channel",
-            "https://repo.anaconda.com/pkgs/r",
-        ],
-    ]
+    # Verify conda environment exists and use it
+    print("Setting up conda environment for training...")
 
-    for cmd in tos_commands:
-        subprocess.run(cmd, capture_output=True, text=True)
+    # Check if the RiemannianRF environment exists
+    env_check = subprocess.run(
+        ["/opt/miniconda/bin/conda", "env", "list"],
+        capture_output=True,
+        text=True,
+    )
 
-    # Check if conda environment already exists
-    print("Checking conda environment...")
     conda_python = "/opt/miniconda/envs/RiemannianRF/bin/python"
 
-    if os.path.exists(conda_python):
-        print("Conda environment already exists, skipping creation")
-        env_setup_success = True
-    else:
-        # Create conda environment from the copied environment.yml
-        print("Setting up conda environment...")
-        env_setup = subprocess.run(
-            ["/opt/miniconda/bin/conda", "env", "create", "-f", "/app/environment.yml"],
+    if "RiemannianRF" in env_check.stdout and os.path.exists(conda_python):
+        print("✓ RiemannianRF conda environment found")
+        python_executable = conda_python
+
+        # Install ML packages needed for training into conda environment
+        print("Installing ML packages into conda environment...")
+        conda_pip = "/opt/miniconda/envs/RiemannianRF/bin/pip"
+
+        # Install typing_extensions FIRST (critical for PyTorch imports)
+        print("Installing typing_extensions (critical dependency)...")
+        typing_result = subprocess.run(
+            [conda_pip, "install", "typing_extensions>=4.8.0"],
             capture_output=True,
-            text=True,
+            text=True
         )
-        env_setup_success = env_setup.returncode == 0
+        if typing_result.returncode == 0:
+            print("✓ typing_extensions installed successfully")
+        else:
+            print(f"✗ typing_extensions installation failed: {typing_result.stderr[:200]}...")
 
-    if not env_setup_success:
-        print(f"Conda environment setup output: {env_setup.stdout if 'env_setup' in locals() else 'N/A'}")
-        print(f"Conda environment setup error: {env_setup.stderr if 'env_setup' in locals() else 'N/A'}")
-        print("Environment creation failed, falling back to base conda python")
+        # Install base system packages
+        print("Installing base system packages...")
+        base_packages = [
+            "wheel>=0.40.0",
+            "setuptools>=65.0.0",
+            "packaging>=21.0",
+            "six>=1.16.0",
+            "numpy>=1.24.0",
+            "filelock>=3.12.0",
+            "pyyaml>=6.0",
+            "fsspec>=2023.1.0",
+            "protobuf>=3.20.0",
+            "colorama>=0.4.6"
+        ]
+
+        for package in base_packages:
+            pkg_name = package.split('>=')[0].split('==')[0]
+            print(f"Installing {pkg_name}...")
+            install_result = subprocess.run(
+                [conda_pip, "install", package],
+                capture_output=True,
+                text=True
+            )
+            if install_result.returncode == 0:
+                print(f"✓ {pkg_name} installed successfully")
+            else:
+                print(f"✗ {pkg_name} failed: {install_result.stderr[:100]}...")
+
+        # Install PyTorch with CUDA support (after typing_extensions)
+        print("Installing PyTorch 2.4.1 with CUDA 12.1...")
+        torch_result = subprocess.run(
+            [conda_pip, "install", "torch==2.4.1", "torchvision==0.19.1", "--index-url", "https://download.pytorch.org/whl/cu121"],
+            capture_output=True,
+            text=True
+        )
+        if torch_result.returncode == 0:
+            print("✓ PyTorch 2.4.1 installed successfully")
+        else:
+            print(f"✗ PyTorch installation failed: {torch_result.stderr[:200]}...")
+
+        # Install ML packages that require PyTorch
+        print("Installing ML packages...")
+        ml_packages = [
+            "tokenizers>=0.19.0",
+            "transformers>=4.44.0",
+            "accelerate>=0.33.0",
+            "huggingface-hub>=0.24.0",
+            "diffusers>=0.30.0",
+            "torchao==0.5.0",
+            "torch-optimi>=0.2.0",
+            "bitsandbytes>=0.44.0",
+            "safetensors>=0.3.0",
+            "regex>=2023.0.0",
+            "scipy>=1.10.0",
+            "psutil>=5.9.0",
+            "sympy>=1.12",
+            "networkx>=3.0",
+            "jinja2>=3.0.0",
+            "MarkupSafe>=2.1.0",
+            "einops>=0.7.0"
+        ]
+
+        for package in ml_packages:
+            pkg_name = package.split('>=')[0].split('==')[0]
+            print(f"Installing {pkg_name}...")
+            install_result = subprocess.run(
+                [conda_pip, "install", package],
+                capture_output=True,
+                text=True
+            )
+            if install_result.returncode == 0:
+                print(f"✓ {pkg_name} installed successfully")
+            else:
+                print(f"✗ {pkg_name} failed: {install_result.stderr[:100]}...")
+
+        # Test critical imports in conda environment
+        print("Testing critical imports in conda environment...")
+        test_imports = [
+            "torch",
+            "torchao",
+            "transformers",
+            "accelerate",
+            "bitsandbytes",
+            "diffusers"
+        ]
+
+        all_imports_successful = True
+        for import_name in test_imports:
+            test_result = subprocess.run(
+                [conda_python, "-c", f"import {import_name}; print('✓ {import_name} imported successfully')"],
+                capture_output=True,
+                text=True,
+            )
+            if test_result.returncode == 0:
+                print(test_result.stdout.strip())
+            else:
+                print(f"✗ {import_name} import failed: {test_result.stderr.strip()}")
+                all_imports_successful = False
+
+        if all_imports_successful:
+            print("✓ All critical imports successful in conda environment!")
+        else:
+            print("✗ Some imports failed in conda environment")
+
     else:
-        # Install missing dependencies and ensure proper package installation
-        print("Installing and verifying dependencies...")
-        if os.path.exists(conda_python):
-            # First, ensure core dependencies are properly installed
-            core_deps = ["idna", "charset-normalizer", "urllib3", "certifi", "requests"]
-            for dep in core_deps:
-                dep_install = subprocess.run(
-                    [conda_python, "-m", "pip", "install", "--upgrade", "--force-reinstall", dep],
-                    capture_output=True,
-                    text=True,
-                )
-                if dep_install.returncode == 0:
-                    print(f"Successfully installed/upgraded {dep}")
-                else:
-                    print(f"Failed to install {dep}: {dep_install.stderr}")
-
-            # Reinstall accelerate and huggingface-hub to ensure they work with our environment
-            critical_packages = ["accelerate", "huggingface-hub", "transformers"]
-            for package in critical_packages:
-                print(f"Reinstalling {package}...")
-                pkg_install = subprocess.run(
-                    [conda_python, "-m", "pip", "install", "--upgrade", "--force-reinstall", package],
-                    capture_output=True,
-                    text=True,
-                )
-                if pkg_install.returncode == 0:
-                    print(f"Successfully reinstalled {package}")
-                else:
-                    print(f"Failed to reinstall {package}: {pkg_install.stderr}")
+        print("✗ RiemannianRF conda environment not found")
+        print("Available environments:")
+        print(env_check.stdout)
+        print("Falling back to base conda python")
+        python_executable = "/opt/miniconda/bin/python"
 
     # Create .venv directory that the training script expects
     print("Setting up .venv directory...")
     venv_path = "/app/.venv"
     os.makedirs(venv_path, exist_ok=True)
 
-    # Test environment before training
+    # Test environment before training with minimal imports
     print("Testing environment setup...")
-    test_result = subprocess.run(
-        [conda_python, "-c", "import idna, requests, accelerate, transformers; print('Environment test passed')"],
-        capture_output=True,
-        text=True,
-    )
-    if test_result.returncode == 0:
-        print("✓ Environment test passed")
-    else:
-        print(f"✗ Environment test failed: {test_result.stderr}")
-        print("Continuing anyway...")
+    test_imports = [
+        "import idna; print('✓ idna')",
+        "import requests; print('✓ requests')",
+        "import torch; print('✓ torch')",
+        "import accelerate; print('✓ accelerate')",
+        "import transformers; print('✓ transformers')",
+        "import diffusers; print('✓ diffusers')",
+        "import torchao; print('✓ torchao')"
+    ]
 
-    # Set environment variables for the training
+    for test_import in test_imports:
+        test_result = subprocess.run(
+            [python_executable, "-c", test_import],
+            capture_output=True,
+            text=True,
+        )
+        if test_result.returncode == 0:
+            print(test_result.stdout.strip())
+        else:
+            print(f"✗ Import failed: {test_import}")
+            print(f"  Error: {test_result.stderr.strip()}")
+
+    # Set environment variables for the training - using conda environment
     env = os.environ.copy()
+    python_dir = os.path.dirname(python_executable)
+
+    # Determine conda environment settings
+    if "RiemannianRF" in python_executable:
+        virtual_env = "/opt/miniconda/envs/RiemannianRF"
+        conda_default_env = "RiemannianRF"
+        conda_prefix = "/opt/miniconda/envs/RiemannianRF"
+        path_prefix = "/opt/miniconda/envs/RiemannianRF/bin:/opt/miniconda/bin"
+        print("✓ Using RiemannianRF conda environment for training")
+    else:
+        virtual_env = "/opt/miniconda"
+        conda_default_env = "base"
+        conda_prefix = "/opt/miniconda"
+        path_prefix = "/opt/miniconda/bin"
+        print("Using base conda environment for training")
+
     env.update(
         {
-            "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+            "CUDA_VISIBLE_DEVICES": "0",  # Single A100 GPU
             "CONFIG_ENV_FILE": "config/config_proposed_flux.env",
-            "CONFIG_JSON_FILE": "config/config_coco17_flux_proposed_noregularization.json",
+            "CONFIG_JSON_FILE": "config/config_coco17_flux_testing.json",  # Use testing config
             "CONFIG_BACKEND": "json",
             "DISABLE_UPDATES": "1",
             "PYTHONPATH": "/app",
-            "TRAINING_NUM_PROCESSES": "8",
+            "TRAINING_NUM_PROCESSES": "1",  # Single process for 1 GPU
             "TRAINING_NUM_MACHINES": "1",
             "MIXED_PRECISION": "bf16",
             "MAIN_PROCESS_PORT": "29501",
-            "ACCELERATE_CONFIG_PATH": "/app/accelerate_config_h100.yaml",
+            "ACCELERATE_CONFIG_PATH": "/app/accelerate_config_a100.yaml",  # Use A100 config
             "VENV_PATH": "/app/.venv",  # Set the VENV_PATH that training script expects
-            "VIRTUAL_ENV": "/opt/miniconda/envs/RiemannianRF",  # Set VIRTUAL_ENV for conda
-            "CONDA_DEFAULT_ENV": "RiemannianRF",
-            "CONDA_PREFIX": "/opt/miniconda/envs/RiemannianRF",
+            "VIRTUAL_ENV": virtual_env,
+            "CONDA_DEFAULT_ENV": conda_default_env,
+            "CONDA_PREFIX": conda_prefix,
             # Put conda environment first in PATH
-            "PATH": "/opt/miniconda/envs/RiemannianRF/bin:/opt/miniconda/bin:"
-            + env.get("PATH", ""),
+            "PATH": path_prefix + ":" + env.get("PATH", ""),
             "TOKENIZERS_PARALLELISM": "false",
+            # Force the shell script to use conda environment python
+            "PYTHON": python_executable,
         }
     )
 
     # Copy accelerate config to home directory
     os.makedirs(os.path.expanduser("~/.cache/huggingface/accelerate"), exist_ok=True)
+
+    # Check if A100 config exists, fallback to H100 config
+    a100_config = "/app/accelerate_config_a100.yaml"
+    h100_config = "/app/accelerate_config_h100.yaml"
+
+    if os.path.exists(a100_config):
+        config_source = a100_config
+        print("Using A100 accelerate config")
+    else:
+        config_source = h100_config
+        print("A100 config not found, using H100 config")
+
     shutil.copy(
-        "/app/accelerate_config_h100.yaml",
+        config_source,
         os.path.expanduser("~/.cache/huggingface/accelerate/default_config.yaml"),
     )
 
@@ -439,18 +712,36 @@ def train_model():
     nvjitlink_dir = os.path.join(venv_path, "nvjitlink", "lib")
     os.makedirs(nvjitlink_dir, exist_ok=True)
 
-    # Test accelerate command with proper environment
+    # Test accelerate command with the working python
     print("Testing accelerate command...")
     accelerate_test = subprocess.run(
-        ["/opt/miniconda/envs/RiemannianRF/bin/accelerate", "--help"],
+        [python_executable, "-c", "import accelerate; print('✓ Accelerate import successful')"],
         env=env,
         capture_output=True,
         text=True,
     )
     if accelerate_test.returncode == 0:
-        print("✓ Accelerate command test passed")
+        print("✓ Accelerate python import test passed")
     else:
-        print(f"✗ Accelerate command test failed: {accelerate_test.stderr}")
+        print(f"✗ Accelerate python import test failed: {accelerate_test.stderr}")
+
+    # Test direct accelerate binary
+    accelerate_binary = os.path.join(python_dir, "accelerate")
+    if os.path.exists(accelerate_binary):
+        print(f"Testing accelerate binary: {accelerate_binary}")
+        accelerate_launch_test = subprocess.run(
+            [accelerate_binary, "launch", "--help"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if accelerate_launch_test.returncode == 0:
+            print("✓ Accelerate launch command test passed")
+        else:
+            print(f"✗ Accelerate launch test failed")
+    else:
+        print(f"Accelerate binary not found at {accelerate_binary}")
         print("Will try to continue anyway...")
 
     print("Starting GeodesicFlow training...")
@@ -463,9 +754,9 @@ def train_model():
     ]:
         print(f"  {key}={env.get(key)}")
 
-    # Run the training script
+    # Run the simplified training script that uses base conda
     result = subprocess.run(
-        ["/bin/bash", "/app/train_proposed_noregularization.sh"],
+        ["/bin/bash", "/app/train_testing_base_conda.sh"],
         env=env,
         capture_output=True,
         text=True,
@@ -572,6 +863,7 @@ def main(
     sync_outputs: bool = False,
     upload_text_zip: bool = False,
     test_gpu: bool = False,
+    test_conda: bool = False,
     detach: bool = False,
 ):
     """Main entrypoint for the Modal app
@@ -584,6 +876,11 @@ def main(
         print("Testing GPU access...")
         gpu_result = test_gpu_access.remote()
         print(f"GPU test result: {gpu_result}")
+
+    if test_conda:
+        print("Testing conda environment...")
+        conda_result = test_conda_environment.remote()
+        print(f"Conda test result: {conda_result}")
 
     if upload_text_zip or download_data:
         print("Uploading coco17_only_txt.zip...")
