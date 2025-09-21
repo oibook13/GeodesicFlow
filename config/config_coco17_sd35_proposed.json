@@ -17,7 +17,7 @@
     "--model_type": "lora",
     "--model_family": "sd3",
     "--pretrained_model_name_or_path": "stabilityai/stable-diffusion-3.5-large",
-    "--output_dir": "/n/netscratch/kempner_undergrads/Lab/drakedu/GeodesicFlow/output/coco17_sd35_proposed",
+    "--output_dir": "/n/home05/drakedu/GeodesicFlow/output/coco17_sd35_proposed",
     "--geodesicflow_alpha": 10,
     "--geodesicflow_beta": 5,
     "--geodesicflow_staticlambda": 0.5,
