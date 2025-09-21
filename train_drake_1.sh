@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=train_drake_1
 #SBATCH --account=kempner_undergrads
-#SBATCH --partition=kempner
+#SBATCH --partition=kempner_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gpus-per-node=4
-#SBATCH --time=0-06:00
+#SBATCH --time=0-24:00
 #SBATCH --mem=60G
 #SBATCH --output=/n/home05/drakedu/GeodesicFlow/logs/%x_%j.out
 #SBATCH --error=/n/home05/drakedu/GeodesicFlow/logs/%x_%j.err
