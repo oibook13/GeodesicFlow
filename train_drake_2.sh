@@ -8,8 +8,8 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --time=0-06:00
 #SBATCH --mem=60G
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --output=/n/home05/drakedu/GeodesicFlow/logs/%x_%j.out
+#SBATCH --error=/n/home05/drakedu/GeodesicFlow/logs/%x_%j.err
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=drakedu@college.harvard.edu
 
