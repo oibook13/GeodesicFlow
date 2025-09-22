@@ -14,7 +14,7 @@ PROMPT_DIR="/PHShome/yl535/project/python/datasets/coco17/validation"
 OUTPUT_DIR='generated_images_coco17'
 
 MODEL_PATH=(
-            'output/coco17_flux_proposed_test/checkpoint-50'
+            'output/coco17_flux_proposed_test/checkpoint-100'
             )
 NUM_PROMPTS_PER_RUN=1
 

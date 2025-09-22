@@ -158,23 +158,6 @@ diffusers.utils.logging.set_verbosity_warning()
 
 
 # --- GeodesicFlow Components ---
-class LambdaMLP(nn.Module):
-    """A lightweight MLP to predict the adaptive blending weight lambda."""
-    def __init__(self, input_dim, hidden_dim=64, num_layers=2):
-        super().__init__()
-        layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU()]
-        for _ in range(num_layers - 2):
-            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
-        if num_layers > 1:
-            layers.append(nn.Linear(hidden_dim, 1))
-        else: # Handle single-layer case
-            layers = [nn.Linear(input_dim, 1)]
-        layers.append(nn.Sigmoid())
-        self.mlp = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.mlp(x)
-
 def project_to_tangent_space(v, x):
     """Projects vector v onto the tangent space of x on the unit sphere."""
     # Proj_x(v) = v - <v, x> * x
@@ -205,8 +188,6 @@ class Trainer:
         self.text_encoder_3 = None
         self.controlnet = None
         self.validation = None
-        # GeodesicFlow
-        self.lambda_mlp = None
 
     def _config_to_obj(self, config):
         if not config:
@@ -219,12 +200,6 @@ class Trainer:
         # Set default values for GeodesicFlow hyperparameters immediately after loading config
         if not hasattr(self.config, 'geodesicflow_enabled'):
             self.config.geodesicflow_enabled = True
-        if not hasattr(self.config, 'geodesicflow_eta'):
-            self.config.geodesicflow_eta = 0.1
-        if not hasattr(self.config, 'geodesicflow_mlp_hidden_dim'):
-            self.config.geodesicflow_mlp_hidden_dim = 64
-        if not hasattr(self.config, 'geodesicflow_mlp_num_layers'):
-            self.config.geodesicflow_mlp_num_layers = 2
         
         report_to = (
             None if self.config.report_to.lower() == "none" else self.config.report_to
@@ -661,12 +636,6 @@ class Trainer:
             return
 
         logger.info("Initializing GeodesicFlow components.")
-        # Initialize MLP with a fixed input dimension of 1 for tilde_rho
-        # self.lambda_mlp = LambdaMLP(
-        #     input_dim=1,
-        #     hidden_dim=self.config.geodesicflow_mlp_hidden_dim,
-        #     num_layers=self.config.geodesicflow_mlp_num_layers
-        # )
 
     def init_data_backend(self):
         try:
@@ -1140,12 +1109,6 @@ class Trainer:
             model_type_label=self.config.model_type_label,
             lycoris_wrapped_network=self.lycoris_wrapped_network,
         )
-
-        # if self.config.geodesicflow_enabled and self.lambda_mlp is not None:
-        #     logger.info("Adding GeodesicFlow Lambda MLP parameters to optimizer.")
-        #     self.params_to_optimize.append(
-        #         {"params": self.lambda_mlp.parameters(), "lr": self.config.learning_rate}
-        #     )
         
         if self.config.use_deepspeed_optimizer:
             logger.info(
@@ -1627,34 +1590,10 @@ class Trainer:
         self.init_optimizer()
         lr_scheduler = self.init_lr_scheduler()
 
-        # --- Start of Correction ---
-        # 1. Initialize LambdaMLP before preparing models and loading state.
-        if self.config.geodesicflow_enabled:
-            logger.info("Initializing GeodesicFlow MLP before loading checkpoint.")
-            unwrapped_model = unwrap_model(self.accelerator, self.transformer if self.transformer is not None else self.unet)
-            latent_channels = unwrapped_model.config.in_channels if unwrapped_model else 4
-            
-            self.lambda_mlp = LambdaMLP(
-                input_dim=latent_channels,
-                hidden_dim=self.config.geodesicflow_mlp_hidden_dim,
-                num_layers=self.config.geodesicflow_mlp_num_layers
-            )
-            self.lambda_mlp.to(self.accelerator.device, dtype=self.config.weight_dtype)
-            
-            logger.info("Adding GeodesicFlow MLP parameters to the optimizer.")
-            self.optimizer.add_param_group(
-                {"params": self.lambda_mlp.parameters(), "lr": self.config.learning_rate}
-            )
-        # --- End of Correction ---
-
         self.init_hooks()
         self.init_prepare_models(lr_scheduler=lr_scheduler)
         
-        # Prepare the lambda_mlp separately if it exists
-        if self.lambda_mlp:
-            self.lambda_mlp = self.accelerator.prepare(self.lambda_mlp)
-
-        # 2. Now that the optimizer has the correct structure, load the checkpoint.
+        # Now that the optimizer has the correct structure, load the checkpoint.
         lr_scheduler = self.init_resume_checkpoint(lr_scheduler=lr_scheduler)
         self.init_post_load_freeze()
 
@@ -1784,7 +1723,7 @@ class Trainer:
             initial_msg += f"\n  - Steps completed: {self.state['global_step']}"
         initial_msg += f"\n-  Total optimization steps remaining = {max(0, self.config.total_steps_remaining_at_start)}"
         if self.config.geodesicflow_enabled:
-            initial_msg += f"\n-  GeodesicFlow Training Enabled (eta={self.config.geodesicflow_eta})"
+            initial_msg += f"\n-  GeodesicFlow Training Enabled"
 
         logger.info(initial_msg)
         self._send_webhook_msg(message=initial_msg)
@@ -2179,9 +2118,6 @@ class Trainer:
                 if self.transformer is not None:
                     self.transformer.train()
                     training_models = [self.transformer]
-            if self.config.geodesicflow_enabled and self.lambda_mlp:
-                 self.lambda_mlp.train()
-                 # The lambda_mlp params are in the main optimizer, so no need to add the model here
             if (
                 "lora" in self.config.model_type
                 and self.config.train_text_encoder
@@ -2232,29 +2168,6 @@ class Trainer:
                 self._exit_on_signal()
                 step += 1
                 batch = iterator_fn(step, *iterator_args)
-                
-                # Lazy initialization of GeodesicFlow MLP on the first step
-                # if self.config.geodesicflow_enabled and self.lambda_mlp is None:
-                #     logger.info("First training step. Lazily initializing GeodesicFlow MLP.")
-                #     latent_channels = batch["latent_batch"].shape[1]
-                #     logger.info(f"Detected {latent_channels} latent channels. LambdaMLP input_dim: {latent_channels}")
-                    
-                #     self.lambda_mlp = LambdaMLP(
-                #         input_dim=latent_channels, # Input dim is now the number of channels
-                #         hidden_dim=self.config.geodesicflow_mlp_hidden_dim,
-                #         num_layers=self.config.geodesicflow_mlp_num_layers
-                #     )
-                #     # Cast to correct dtype and move to device
-                #     self.lambda_mlp.to(self.accelerator.device, dtype=self.config.weight_dtype)
-                    
-                #     # Prepare the new model with accelerator
-                #     self.lambda_mlp = self.accelerator.prepare(self.lambda_mlp)
-                    
-                #     # Add its parameters to the existing optimizer
-                #     logger.info("Adding GeodesicFlow MLP parameters to the optimizer.")
-                #     self.optimizer.add_param_group(
-                #         {"params": self.lambda_mlp.parameters(), "lr": self.config.learning_rate}
-                #     )
                 
                 training_logger.debug(f"Iterator: {iterator_fn}")
                 if self.config.lr_scheduler == "cosine_with_restarts":
@@ -2335,9 +2248,6 @@ class Trainer:
                         t_continuous = torch.rand(bsz, 1, device=self.accelerator.device)
                         timesteps = (t_continuous.squeeze(1) * (self.noise_scheduler.config.num_train_timesteps - 1)).long()
 
-                        # dot_product = torch.sum(x0 * x1, dim=1, keepdim=True)
-                        # theta = torch.acos(torch.clamp(dot_product, -1.0 + 1e-7, 1.0 - 1e-7))
-                        # sin_theta = torch.sin(theta)
                         dot_product = torch.clamp(torch.sum(x0 * x1, dim=1, keepdim=True), -1.0 + 1e-7, 1.0 - 1e-7)
                         theta = torch.acos(dot_product)
                         sin_theta = torch.sin(theta)
@@ -2362,23 +2272,13 @@ class Trainer:
                         u_t_geo = v0 - (v0_dot_zt_geo / (denom_pt + 1e-7)) * x1_minus_proj
 
                         # Euclidean Velocity
-                        # u_t_euc = x1 - x0
                         u_t_euc_ambient = x1 - x0
                         # Project it onto the tangent space of z_t_euc before using it in the loss
                         u_t_euc = project_to_tangent_space(u_t_euc_ambient, z_t_euc)
 
-                        # 3. Compute density proxy and predict lambda
+                        # 3. Compute density proxy
                         rho = torch.norm(u_t_geo, p=2, dim=1, keepdim=True)
-                        tilde_rho = 1.0 - rho / math.pi
-                        # lambda_val = self.lambda_mlp(z_t_geo.detach())
-
-                        z_t_geo_reshaped = z_t_geo.view(original_shape)
-                        pooled_zt_geo = F.adaptive_avg_pool2d(
-                            z_t_geo_reshaped, (1, 1)
-                        ).view(bsz, -1) # Shape: (bsz, channels)
-
-                        # 3. Predict lambda using the pooled, fixed-size input
-                        lambda_val = self.lambda_mlp(pooled_zt_geo.detach())
+                        tilde_rho = 1.0 # 1.0 - rho / math.pi
 
                         # 4. Reshape paths for the model input
                         z_t_geo_reshaped = z_t_geo.view(original_shape).to(dtype=self.config.weight_dtype)
@@ -2403,10 +2303,9 @@ class Trainer:
                         loss_geo = F.mse_loss(pred_geo.float(), u_t_geo.float(), reduction="none").mean(dim=1)
                         loss_euc = F.mse_loss(pred_euc.float(), u_t_euc.float(), reduction="none").mean(dim=1)
 
-                        loss_adaptive = (1 - lambda_val.squeeze(1).float()) * loss_euc + lambda_val.squeeze(1).float() * loss_geo
-                        loss_lambda = F.mse_loss(lambda_val.float(), tilde_rho.float())
+                        loss_adaptive = (1 - tilde_rho.squeeze(1).float()) * loss_euc + tilde_rho.squeeze(1).float() * loss_geo
                         
-                        loss = loss_adaptive.mean() + self.config.geodesicflow_eta * loss_lambda
+                        loss = loss_adaptive.mean()
                         
                     # --- Original Logic ---
                     else:
@@ -2510,8 +2409,6 @@ class Trainer:
                     if grad_norm is not None: wandb_logs["grad_norm"] = grad_norm.item()
                     if self.config.geodesicflow_enabled:
                         wandb_logs["geodesicflow_loss_adaptive"] = loss_adaptive.mean().item()
-                        wandb_logs["geodesicflow_loss_lambda"] = loss_lambda.item()
-                        wandb_logs["geodesicflow_avg_lambda"] = lambda_val.mean().item()
 
                     progress_bar.update(1)
                     self.state["global_step"] += 1
@@ -2537,12 +2434,6 @@ class Trainer:
                             self.mark_optimizer_eval()
                             self.accelerator.save_state(save_path)
                             self.mark_optimizer_train()
-
-                            if self.config.geodesicflow_enabled and hasattr(self, 'lambda_mlp') and self.lambda_mlp is not None:
-                                logger.info(f"Saving LambdaMLP state to {save_path}/lambda_mlp.safetensors")
-                                unwrapped_lambda_mlp = unwrap_model(self.accelerator, self.lambda_mlp)
-                                lambda_mlp_path = os.path.join(save_path, "lambda_mlp.safetensors")
-                                save_file(unwrapped_lambda_mlp.state_dict(), lambda_mlp_path)
 
                 
                 logs = {"step_loss": loss.detach().item(), "lr": float(self.lr)}

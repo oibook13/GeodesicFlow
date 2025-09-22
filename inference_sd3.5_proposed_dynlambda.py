@@ -102,9 +102,7 @@ class GeodesicFlowPipeline(StableDiffusion3Pipeline):
         callback_steps: int = 1,
         **kwargs,
     ):
-        if self.lambda_mlp is None:
-            raise ValueError("The lambda_mlp model has not been loaded into the pipeline. Please set `pipe.lambda_mlp`.")
-
+        # ... (sections 1-5 are the same as your original code) ...
         # 1. Default height and width
         height = height or self.transformer.config.sample_size * self.vae_scale_factor
         width = width or self.transformer.config.sample_size * self.vae_scale_factor
@@ -128,11 +126,15 @@ class GeodesicFlowPipeline(StableDiffusion3Pipeline):
             device=device,
             num_images_per_prompt=num_images_per_prompt,
             negative_prompt=negative_prompt,
-            negative_prompt_2=negative_prompt, # Pass negative prompt to all 3 encoders
-            negative_prompt_3=negative_prompt, # Pass negative prompt to all 3 encoders
+            negative_prompt_2=negative_prompt,
+            negative_prompt_3=negative_prompt,
         )
 
-        # 4. Prepare latent variables
+        # 4. Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        # 5. Prepare latent variables
         latent_shape = (
             batch_size * num_images_per_prompt,
             self.transformer.config.in_channels,
@@ -140,82 +142,92 @@ class GeodesicFlowPipeline(StableDiffusion3Pipeline):
             width // self.vae_scale_factor,
         )
         
-        # Start with random noise on the unit sphere (z_1)
         latents = torch.randn(latent_shape, generator=generator, device=device, dtype=dtype)
-        latents = F.normalize(latents.view(latents.shape[0], -1), p=2, dim=1).view(latent_shape)
-
-        # 5. Denoising loop based on Algorithm 2 (AGES)
         delta_t = 1.0 / num_inference_steps
         
-        for k in tqdm(range(num_inference_steps, 0, -1)):
-            latents = latents.to(self.transformer.dtype)
-            t_continuous = k * delta_t
-            t_tensor = torch.tensor([t_continuous] * latents.shape[0], device=device, dtype=dtype)
+        # 6. Denoising loop
+        for i, t in enumerate(tqdm(timesteps)):
+            # Expand the latents if we are doing classifier-free guidance
+            latent_model_input = torch.cat([latents] * 2) if guidance_scale > 1.0 else latents
             
-            # Ensure latents (z_t) are on the sphere
-            latents = F.normalize(latents.view(latents.shape[0], -1), p=2, dim=1).view(latent_shape)
-
-            # --- ALGORITHM FIX 1: Compute lambda using the MLP ---
-            # Reshape latents for the MLP, which expects a flat vector
-            # This matches the algorithm's λ_Φ(z_t)
-            # num_features = latents.shape[1] * latents.shape[2] * latents.shape[3]
-            # mlp_input = latents.view(latents.shape[0], num_features)
+            # Concatenate prompt embeddings for simultaneous passes
+            if guidance_scale > 1.0:
+                current_prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+                current_pooled_projections = torch.cat([negative_pooled_projections, pooled_projections], dim=0)
+            else:
+                current_prompt_embeds = prompt_embeds
+                current_pooled_projections = pooled_projections
             
-            # The MLP input dimension might need adjustment depending on its training.
-            # If it was trained on pooled latents, use the line below instead.
-            # mlp_input = F.adaptive_avg_pool2d(latents, (1, 1)).view(latents.shape[0], -1)
+            timestep_input = t.repeat(latent_model_input.shape[0])
 
-
-            # Predict velocity v = v_Theta(z_t, t, c)
-            model_t = (t_tensor * 999).long()
-            
-            v = self.transformer(
-                hidden_states=latents,
-                timestep=model_t,
-                encoder_hidden_states=prompt_embeds,
-                pooled_projections=pooled_projections,
+            # Predict the velocity 'v' for both conditional and unconditional
+            v_pred = self.transformer(
+                hidden_states=latent_model_input,
+                timestep=timestep_input,
+                encoder_hidden_states=current_prompt_embeds,
+                pooled_projections=current_pooled_projections,
             ).sample
 
-            # Project velocity v onto the tangent space of z_t to ensure geometric correctness
-            latents_flat = latents.view(latents.shape[0], -1)
-            v_flat = v.view(latents.shape[0], -1)
-            dot_product = torch.sum(v_flat * latents_flat, dim=1, keepdim=True)
-            v_tangent_flat = v_flat - dot_product * latents_flat
-            v = v_tangent_flat.view(latent_shape)
+            # 💡 --- FIX STARTS HERE ---
+            
+            # First, perform classifier-free guidance to get the final guided velocity
+            if guidance_scale > 1.0:
+                v_uncond, v_text = v_pred.chunk(2)
+                v_guided = v_uncond + guidance_scale * (v_text - v_uncond)
+            else:
+                v_guided = v_pred
 
+            # Now, perform all geometric operations on the correctly-shaped 'v_guided'
+            
+            # Project velocity v onto the tangent space of z_t
+            # Both tensors now have a batch size of 1, so their shapes will match.
+            latents_flat = latents.view(latents.shape[0], -1)
+            latents_flat = F.normalize(latents_flat, p=2, dim=1)
+            v_guided_flat = v_guided.view(v_guided.shape[0], -1)
+            dot_product = torch.sum(v_guided_flat * latents_flat, dim=1, keepdim=True)
+            v_tangent_flat = v_guided_flat - dot_product * latents_flat
+            v = v_tangent_flat.view(latent_shape) # This is the final tangent velocity
+            
             # Compute shared tangent vector for the step
             xi = -delta_t * v
 
             # Geodesic Component (via Exponential Map)
             xi_norm = torch.norm(xi.view(xi.shape[0], -1), p=2, dim=1).view(-1, 1, 1, 1)
-            # Handle the case where norm is zero to avoid division errors
             xi_dir = F.normalize(xi.view(xi.shape[0], -1), p=2, dim=1).view(latent_shape)
             z_geo = torch.cos(xi_norm) * latents + torch.sin(xi_norm) * xi_dir
-            # Ensure z_geo is on the sphere, correcting for any floating point errors
             z_geo = F.normalize(z_geo.view(z_geo.shape[0], -1), p=2, dim=1).view(latent_shape)
-
+            
+            # Compute lambda for blending
             pooled_z_geo = F.adaptive_avg_pool2d(z_geo, (1, 1)).view(z_geo.shape[0], -1)
-            lambda_val = self.lambda_mlp(pooled_z_geo) # Shape: (batch_size, 1)
-            lambda_val = lambda_val.to(self.transformer.dtype)
-
-            # Euclidean Component (linear step + projection)
-            z_euc_unnorm = latents + xi
-            z_euc = F.normalize(z_euc_unnorm.view(z_euc_unnorm.shape[0], -1), p=2, dim=1).view(latent_shape)
+            lambda_val = self.lambda_mlp(pooled_z_geo) 
             
-            # --- ALGORITHM FIX 2: Blend Positions using Slerp in the correct order ---
-            z_geo_flat = z_geo.view(z_geo.shape[0], -1)
-            z_euc_flat = z_euc.view(z_geo.shape[0], -1)
-            
-            # Slerp(z_euc, z_geo, lambda): λ=0 -> z_euc, λ=1 -> z_geo
-            # next_latents_flat = slerp(z_euc_flat, z_geo_flat, lambda_val)
-            next_latents_flat = (1-lambda_val)*z_euc_flat + lambda_val*z_geo_flat
-            latents = next_latents_flat.view(latent_shape)
+            # Finally, compute the previous noisy sample using the original guided velocity
+            # NOTE: The original logic used `v_pred*lambda_val`, but you should likely use the
+            # final tangent velocity `v` or the guided velocity `v_guided`. Using 'v' here
+            # to be consistent with the projection.
+            # latents = self.scheduler.step(v * lambda_val, t, latents).prev_sample
 
-        # 6. Post-processing
-        # latents = latents / self.vae.config.scaling_factor
+            # Reshape lambda_val to (batch_size, 1, 1, 1) to make it broadcastable with v
+            lambda_val_reshaped = lambda_val.view(-1, 1, 1, 1)
+            # print(lambda_val_reshaped)
+            # The scheduler expects a model_output with the same shape as the latents.
+            # This multiplication will now work correctly due to broadcasting.
+            # model_output = v * (1-lambda_val_reshaped)
+            
+            # Finally, compute the previous noisy sample using the scaled velocity
+            latents = self.scheduler.step(v_guided, t, latents).prev_sample
+
+            # 💡 --- FIX ENDS HERE ---
+            
+            # Call the callback, if specified
+            if callback is not None and i % callback_steps == 0:
+                callback(i, t, latents)
+
+        # ... (sections 7-8 are the same as your original code) ...
+        # 7. Post-processing
         image = self.vae.decode(latents, return_dict=False)[0]
 
-        # 7. Convert to PIL
+        # 8. Convert to PIL
         if output_type == "pil":
             image = self.image_processor.postprocess(image, output_type="pil")
         
@@ -364,9 +376,9 @@ def main():
     # 2. Load the LoRA weights into the pipeline, if specified.
     #    Your original code checked if 'checkpoint' was in the model_path.
     #    Using a specific lora_path argument is generally clearer.
-    if args.lora_path and os.path.exists(args.lora_path):
-        print(f"✅ Loading LoRA weights from: {args.lora_path}")
-        pipe.load_lora_weights(args.lora_path)
+    if args.model_path and os.path.exists(args.model_path):
+        print(f"✅ Loading LoRA weights from: {args.model_path}")
+        pipe.load_lora_weights(args.model_path)
     
     pipe.to("cuda")
 

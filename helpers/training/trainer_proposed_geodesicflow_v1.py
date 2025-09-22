@@ -2335,14 +2335,9 @@ class Trainer:
                         t_continuous = torch.rand(bsz, 1, device=self.accelerator.device)
                         timesteps = (t_continuous.squeeze(1) * (self.noise_scheduler.config.num_train_timesteps - 1)).long()
 
-                        # dot_product = torch.sum(x0 * x1, dim=1, keepdim=True)
-                        # theta = torch.acos(torch.clamp(dot_product, -1.0 + 1e-7, 1.0 - 1e-7))
-                        # sin_theta = torch.sin(theta)
-                        dot_product = torch.clamp(torch.sum(x0 * x1, dim=1, keepdim=True), -1.0 + 1e-7, 1.0 - 1e-7)
-                        theta = torch.acos(dot_product)
+                        dot_product = torch.sum(x0 * x1, dim=1, keepdim=True)
+                        theta = torch.acos(torch.clamp(dot_product, -1.0 + 1e-7, 1.0 - 1e-7))
                         sin_theta = torch.sin(theta)
-                        # Add epsilon to sin_theta to prevent division by zero when paths are collinear
-                        sin_theta = sin_theta + 1e-7
                         
                         # Slerp for Geodesic Path
                         a = torch.sin((1 - t_continuous) * theta) / (sin_theta + 1e-7)
@@ -2362,10 +2357,7 @@ class Trainer:
                         u_t_geo = v0 - (v0_dot_zt_geo / (denom_pt + 1e-7)) * x1_minus_proj
 
                         # Euclidean Velocity
-                        # u_t_euc = x1 - x0
-                        u_t_euc_ambient = x1 - x0
-                        # Project it onto the tangent space of z_t_euc before using it in the loss
-                        u_t_euc = project_to_tangent_space(u_t_euc_ambient, z_t_euc)
+                        u_t_euc = x1 - x0
 
                         # 3. Compute density proxy and predict lambda
                         rho = torch.norm(u_t_geo, p=2, dim=1, keepdim=True)

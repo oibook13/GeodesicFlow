@@ -26,7 +26,9 @@ GEN_IMAGE_DIR=(
             # 'output/coco17_proposed_sep12/checkpoint-24000/generated_images_coco17'
             # 'output/coco17_proposed_RCFM/checkpoint-26000/generated_images_coco17'
             # 'output/coco17_proposed_RCFM/checkpoint-24000/generated_images_coco17'
-            'output/coco17_flux_lr1e-6/checkpoint-14000/generated_images_coco17'
+            # 'output/coco17_flux_lr1e-6/checkpoint-14000/generated_images_coco17'
+            'output/coco17_sd35_proposed/checkpoint-12250/generated_images_coco17_lambda1'
+            'output/coco17_sd35_proposed/checkpoint-12250/generated_images_coco17_dynlambda'
                  )
 
 # ORG_IMAGE_DIR="/PHShome/yl535/project/python/datasets/coco14/val"
