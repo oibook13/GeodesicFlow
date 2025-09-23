@@ -28,7 +28,31 @@ from diffusers.models.embeddings import (
 )
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.normalization import AdaLayerNormContinuous, FP32LayerNorm
+from diffusers.models.normalization import AdaLayerNormContinuous
+
+# Use robust import handling for FP32LayerNorm
+try:
+    from helpers.import_utils import import_diffusers_with_fallbacks
+    FP32LayerNorm = import_diffusers_with_fallbacks()
+except ImportError:
+    # Direct fallback if import_utils is not available
+    try:
+        from diffusers.models.normalization import FP32LayerNorm
+    except ImportError:
+        # Fallback implementation for FP32LayerNorm if not available in diffusers
+        class FP32LayerNorm(nn.LayerNorm):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+
+            def forward(self, x):
+                output = F.layer_norm(
+                    x.float(),
+                    self.normalized_shape,
+                    self.weight.float() if self.weight is not None else None,
+                    self.bias.float() if self.bias is not None else None,
+                    self.eps,
+                )
+                return output.type_as(x)
 from diffusers.models.transformers.hunyuan_transformer_2d import AdaLayerNormShift
 from diffusers.utils import logging
 

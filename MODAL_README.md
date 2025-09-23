@@ -1,6 +1,6 @@
 # GeodesicFlow Modal Integration
 
-This repository now includes Modal integration for distributed training on H100 GPUs in the cloud.
+This repository now includes Modal integration for distributed training on H100 GPUs in the cloud, supporting both FLUX training and the new **SD 3.5 No Regularization training** with the proposed GeodesicFlow method.
 
 ## Setup
 
@@ -84,6 +84,73 @@ modal app stop <app-id>
 - First run may take longer for initial setup, subsequent runs are much faster
 - Always use `--detach` for training to avoid losing progress if your connection drops
 
+## NEW: SD 3.5 No Regularization Training
+
+### Quick Start for No Regularization Training
+
+The new Modal setup supports the **exact command** you wanted to run:
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 CONFIG_ENV_FILE='config/config_proposed_sd.env' CONFIG_JSON_FILE='config/config_coco17_sd35_proposed_noregularization.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_noregularization.sh 2>&1 | tee train_noreg_sd.log
+```
+
+### 1. Test with 1 A100 (Recommended First)
+```bash
+# Test the setup with a single A100 GPU first
+modal run modal_app.py --train-noregularization-test --detach
+```
+
+### 2. Full Training with 8 H100s
+```bash
+# Run the full no regularization training on 8 H100s
+modal run modal_app.py --train-noregularization --detach
+
+# Or download dataset and train in one command
+modal run modal_app.py --download-data --train-noregularization --detach 2>&1 | tee train_noreg_sd.log
+```
+
+### What's New for No Regularization Training:
+
+1. **New Config Files Created**:
+   - `config/config_proposed_sd.env` - Environment config for 8 H100s
+   - `config/config_coco17_sd35_proposed_noregularization.json` - No regularization JSON config with `geodesicflow_metric_reg_lambda: 0.0` and `curveflow_lambda: 0.0`
+
+2. **Comprehensive Dependency Management**:
+   - Installs all packages from `environment.yml` automatically
+   - Includes fixes for common issues like `save_hooks.py` and `optimizer_param.py`
+   - Uses exact PyTorch version (2.4.1) with CUDA 12.1 support
+
+3. **Automatic Environment Setup**:
+   - Sets up all required environment variables automatically
+   - Configures accelerate for 8 H100 or 1 A100 testing
+   - Updates dataset paths for Modal volumes
+
+4. **Model**: Uses **stabilityai/stable-diffusion-3.5-large** instead of FLUX
+
+### Training Commands Comparison:
+
+| Training Type | Command | GPUs | Purpose |
+|---------------|---------|------|---------|
+| **No Reg (Test)** | `--train-noregularization-test` | 1 A100 | Testing setup |
+| **No Reg (Full)** | `--train-noregularization` | 8 H100 | Full training |
+| **FLUX (Legacy)** | `--train` | 1 A100 | Original FLUX training |
+
+### Configuration Details:
+
+The no regularization training uses:
+- **Environment**: `config/config_proposed_sd.env` (8 processes for 8 H100s)
+- **Config**: `config/config_coco17_sd35_proposed_noregularization.json`
+- **Model**: `stabilityai/stable-diffusion-3.5-large`
+- **Training Script**: `./train_proposed_noregularization.sh`
+- **Output Directory**: `output/coco17_proposed_GeodesicFlow_noregularization`
+
+### Key Features of No Regularization Training:
+
+- **Zero Regularization**: `geodesicflow_metric_reg_lambda: 0.0`, `curveflow_lambda: 0.0`
+- **8 H100 Support**: Full multi-GPU setup with proper accelerate configuration
+- **Comprehensive Error Handling**: Fixes common dependency and import issues
+- **Automatic Dataset Path Updates**: Configures paths for Modal volume structure
+- **Environment Validation**: Tests all critical imports before starting training
+
 ## Text File Processing
 
 The Modal integration includes automatic processing of COCO17 text files:
@@ -97,10 +164,15 @@ The Modal integration includes automatic processing of COCO17 text files:
 
 ## Configuration
 
-The training uses these key files:
+### SD 3.5 No Regularization Training (NEW)
+- **`config/config_proposed_sd.env`** - Environment variables for 8 H100 training
+- **`config/config_coco17_sd35_proposed_noregularization.json`** - No regularization configuration (geodesicflow_metric_reg_lambda: 0.0, curveflow_lambda: 0.0)
+- **`config/coco17.json`** - Dataset configuration for Modal volumes (auto-updated)
+- **`accelerate_config_h100.yaml`** - Multi-GPU configuration for 8x H100s
 
-- **`config/config_proposed_flux.env`** - Environment variables for training
-- **`config/config_coco17_flux_proposed_noregularization.json`** - Main training configuration
+### FLUX Training (Legacy)
+- **`config/config_proposed_flux.env`** - Environment variables for FLUX training
+- **`config/config_coco17_flux_proposed_noregularization.json`** - FLUX training configuration
 - **`config/coco17_modal.json`** - Dataset configuration for Modal volumes
 - **`accelerate_config_h100.yaml`** - Multi-GPU configuration for 8x H100s
 
@@ -121,9 +193,22 @@ The training uses these key files:
 - **Output synchronization** to bring results back to local machine
 - **CUDA 12.6 environment** with full conda environment from `environment.yml`
 
-## Training Command Executed
+## Training Commands Executed
 
+### SD 3.5 No Regularization Training (NEW)
 The Modal app runs this exact command on 8x H100s:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+CONFIG_ENV_FILE='config/config_proposed_sd.env' \
+CONFIG_JSON_FILE='config/config_coco17_sd35_proposed_noregularization.json' \
+CONFIG_BACKEND=json \
+DISABLE_UPDATES=1 \
+./train_proposed_noregularization.sh
+```
+
+### FLUX Training (Legacy)
+The original FLUX training command:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \

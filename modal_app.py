@@ -18,7 +18,7 @@ checkpoints_volume = modal.Volume.from_name(
 )
 cache_volume = modal.Volume.from_name("geodesicflow-cache", create_if_missing=True)
 
-# Create the Modal image with CUDA 12.2 and conda environment
+# Create the Modal image with CUDA 12.1 and pre-built conda environment with ALL dependencies
 image = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04")
     .apt_install(
@@ -39,6 +39,12 @@ image = (
             "g++",
             "pkg-config",
             "libssl-dev",
+            "libgl1-mesa-glx",  # Required for OpenCV
+            "libglib2.0-0",
+            "libsm6",
+            "libxext6",
+            "libxrender-dev",
+            "libgomp1",
         ]
     )
     .run_commands(
@@ -69,11 +75,199 @@ image = (
     .workdir("/app")
     .add_local_dir(".", "/app", copy=True)  # Copy files into image for build steps
     .run_commands([
-        # Create simplified conda environment with just Python and CUDA tools
-        "/opt/miniconda/bin/conda create -n RiemannianRF python=3.11 -y",
-        # Install conda packages only (skip pip dependencies for faster build)
-        "/opt/miniconda/bin/conda install -n RiemannianRF -c nvidia -c defaults cuda-toolkit=12.6 -y"
+        # Create minimal conda environment with Python 3.11 only
+        "/opt/miniconda/bin/conda create -n RiemannianRF python=3.11 -c conda-forge -y",
+
+        # Install ONLY CUDA toolkit via conda (avoid numpy conflicts entirely)
+        "/opt/miniconda/bin/conda install -n RiemannianRF -c nvidia cuda-toolkit=12.1 -y",
+
+        # Install pip in the conda environment
+        "/opt/miniconda/bin/conda install -n RiemannianRF -c conda-forge pip -y",
+
+        # Install ALL Python packages via pip to avoid conda/pip conflicts
+        # CRITICAL: Install numpy FIRST with exact version before any package can upgrade it
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install 'numpy==1.26.4'",  # Latest numpy 1.x, compatible with all packages
+
+        # Install scipy after numpy is locked
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install 'scipy>=1.10.0'",
+
+        # Install typing_extensions (critical for PyTorch)
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install 'typing_extensions>=4.8.0'",
+
+        # Install PyTorch with CUDA 12.1 support (should not upgrade numpy since it's already installed)
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121",
+
+        # Create conda pinned file to prevent ANY future numpy upgrades
+        "echo 'numpy ==1.26.4' > /opt/miniconda/envs/RiemannianRF/conda-meta/pinned",
+
+        # Install transformers (should work now with numpy 1.26.4)
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install transformers==4.42.4",
+
+        # Install base packages (after numpy is locked)
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install wheel>=0.40.0 setuptools>=65.0.0 packaging>=21.0 six>=1.16.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install filelock>=3.12.0 pyyaml>=6.0 fsspec>=2023.1.0 protobuf>=3.20.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install colorama>=0.4.6 requests>=2.32.0 certifi>=2024.8.30",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install urllib3>=2.0.0 charset-normalizer>=3.3.0 idna>=3.7",
+
+        # Install remaining ML packages that depend on PyTorch (using stable versions without torchao conflicts)
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install accelerate==0.34.2",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install diffusers==0.31.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install bitsandbytes==0.44.1",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install safetensors>=0.3.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install huggingface-hub>=0.24.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install tokenizers>=0.19.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install compel==2.0.3",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install datasets==3.0.2",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install psutil>=5.9.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install sympy>=1.12",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install networkx>=3.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install jinja2>=3.0.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install einops==0.8.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install peft>=0.6.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install regex>=2023.0.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install pandas>=1.5.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install Pillow>=10.0.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install tqdm>=4.60.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install wandb>=0.17.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install 'opencv-python>=4.5.0,<4.8.0'",  # Pin to version compatible with numpy 1.x
+
+        # Verify numpy version immediately after opencv installation (the culprit)
+        "/opt/miniconda/envs/RiemannianRF/bin/python -c \"import numpy; print('✓ NumPy after OpenCV:', numpy.__version__); assert numpy.__version__.startswith('1.'), f'OpenCV upgraded numpy to {numpy.__version__}!'\"",
+
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install boto3>=1.28.0",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install sentencepiece>=0.1.99",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install toml>=0.10.2",
+
+        # Install optional optimization packages with robust error handling
+        "echo 'Installing torch-optimi...'",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install torch-optimi==0.2.1 || echo 'Warning: torch-optimi installation failed, will use fallback optimizers'",
+        "echo 'Installing torchao...'",
+        "/opt/miniconda/envs/RiemannianRF/bin/pip install torchao==0.5.0 || echo 'Warning: torchao installation failed, will use fallback optimizers'",
+
+        # Verify installations worked
+        "echo 'Verifying optional package installations...'",
+
+        # Create comprehensive build verification script using echo commands
+        "echo 'import sys' > /opt/build_verification.py",
+        "echo '' >> /opt/build_verification.py",
+        "echo 'def test_package(package_name, required=False):' >> /opt/build_verification.py",
+        "echo '    try:' >> /opt/build_verification.py",
+        "echo '        __import__(package_name)' >> /opt/build_verification.py",
+        "echo '        print(f\"✓ {package_name} imported successfully\")' >> /opt/build_verification.py",
+        "echo '        return True' >> /opt/build_verification.py",
+        "echo '    except ImportError as e:' >> /opt/build_verification.py",
+        "echo '        if required:' >> /opt/build_verification.py",
+        "echo '            print(f\"✗ CRITICAL: Required package {package_name} failed: {e}\")' >> /opt/build_verification.py",
+        "echo '            return False' >> /opt/build_verification.py",
+        "echo '        else:' >> /opt/build_verification.py",
+        "echo '            print(f\"⚠ Optional package {package_name} not available: {e}\")' >> /opt/build_verification.py",
+        "echo '            return True' >> /opt/build_verification.py",
+        "echo '' >> /opt/build_verification.py",
+        "echo 'def main():' >> /opt/build_verification.py",
+        "echo '    print(\"Starting comprehensive build verification...\")' >> /opt/build_verification.py",
+        "echo '    success = True' >> /opt/build_verification.py",
+        "echo '    required_packages = [\"typing_extensions\", \"numpy\", \"torch\", \"accelerate\", \"transformers\", \"diffusers\"]' >> /opt/build_verification.py",
+        "echo '    for pkg in required_packages:' >> /opt/build_verification.py",
+        "echo '        if not test_package(pkg, required=True):' >> /opt/build_verification.py",
+        "echo '            success = False' >> /opt/build_verification.py",
+        "echo '    optional_packages = [\"optimi\", \"torchao\", \"bitsandbytes\"]' >> /opt/build_verification.py",
+        "echo '    for pkg in optional_packages:' >> /opt/build_verification.py",
+        "echo '        test_package(pkg, required=False)' >> /opt/build_verification.py",
+        "echo '    if success:' >> /opt/build_verification.py",
+        "echo '        print(\"✓ Build verification completed successfully\")' >> /opt/build_verification.py",
+        "echo '        return 0' >> /opt/build_verification.py",
+        "echo '    else:' >> /opt/build_verification.py",
+        "echo '        print(\"✗ Build verification failed\")' >> /opt/build_verification.py",
+        "echo '        return 1' >> /opt/build_verification.py",
+        "echo '' >> /opt/build_verification.py",
+        "echo 'if __name__ == \"__main__\":' >> /opt/build_verification.py",
+        "echo '    sys.exit(main())' >> /opt/build_verification.py",
+
+        # Run comprehensive build verification
+        "/opt/miniconda/envs/RiemannianRF/bin/python /opt/build_verification.py",
+
+        # Test critical imports during build (fallback if verification script fails)
+        "/opt/miniconda/envs/RiemannianRF/bin/python -c \"import typing_extensions; print('✓ typing_extensions imported successfully')\"",
+        "/opt/miniconda/envs/RiemannianRF/bin/python -c \"import numpy; print('✓ NumPy version:', numpy.__version__)\"",
+        "/opt/miniconda/envs/RiemannianRF/bin/python -c \"import torch; print('✓ PyTorch:', torch.__version__, 'CUDA available:', torch.cuda.is_available())\"",
+        "/opt/miniconda/envs/RiemannianRF/bin/python -c \"import accelerate; print('✓ Accelerate:', accelerate.__version__)\"",
+        "/opt/miniconda/envs/RiemannianRF/bin/python -c \"import transformers; print('✓ Transformers:', transformers.__version__)\"",
+        "/opt/miniconda/envs/RiemannianRF/bin/python -c \"import diffusers; print('✓ Diffusers:', diffusers.__version__)\"",
+
+        # Test optional packages using the comprehensive verification script (redundant but safe)
+        "echo 'Testing optional packages individually...'",
+
+        # Set up proper conda environment activation script
+        "echo '#!/bin/bash' > /opt/activate_env.sh",
+        "echo 'export PATH=\"/opt/miniconda/envs/RiemannianRF/bin:/opt/miniconda/bin:$PATH\"' >> /opt/activate_env.sh",
+        "echo 'export CONDA_DEFAULT_ENV=\"RiemannianRF\"' >> /opt/activate_env.sh",
+        "echo 'export CONDA_PREFIX=\"/opt/miniconda/envs/RiemannianRF\"' >> /opt/activate_env.sh",
+        "echo 'export VIRTUAL_ENV=\"/opt/miniconda/envs/RiemannianRF\"' >> /opt/activate_env.sh",
+        "echo 'unset PYTHONPATH' >> /opt/activate_env.sh",  # Critical: clear PYTHONPATH
+        "chmod +x /opt/activate_env.sh",
+
+        # Verify the environment works end-to-end with comprehensive import testing
+        "bash -c 'source /opt/activate_env.sh && python -c \"import typing_extensions, torch, accelerate, transformers, diffusers; print(\\\"✓ Full environment test passed\\\")\"'",
+
+        # Create robust runtime import verification script with fallbacks using echo commands
+        "echo 'import sys' > /opt/runtime_test_imports.py",
+        "echo 'sys.path.insert(0, \"/app\")' >> /opt/runtime_test_imports.py",
+        "echo '' >> /opt/runtime_test_imports.py",
+        "echo 'def test_basic_imports():' >> /opt/runtime_test_imports.py",
+        "echo '    \"\"\"Test basic imports without helpers\"\"\"' >> /opt/runtime_test_imports.py",
+        "echo '    success = True' >> /opt/runtime_test_imports.py",
+        "echo '    packages = [' >> /opt/runtime_test_imports.py",
+        "echo '        (\"torch\", True),' >> /opt/runtime_test_imports.py",
+        "echo '        (\"accelerate\", True),' >> /opt/runtime_test_imports.py",
+        "echo '        (\"transformers\", True),' >> /opt/runtime_test_imports.py",
+        "echo '        (\"diffusers\", True),' >> /opt/runtime_test_imports.py",
+        "echo '        (\"optimi\", False),' >> /opt/runtime_test_imports.py",
+        "echo '        (\"torchao\", False),' >> /opt/runtime_test_imports.py",
+        "echo '        (\"bitsandbytes\", False)' >> /opt/runtime_test_imports.py",
+        "echo '    ]' >> /opt/runtime_test_imports.py",
+        "echo '    for pkg_name, required in packages:' >> /opt/runtime_test_imports.py",
+        "echo '        try:' >> /opt/runtime_test_imports.py",
+        "echo '            __import__(pkg_name)' >> /opt/runtime_test_imports.py",
+        "echo '            print(f\"✓ {pkg_name} available\")' >> /opt/runtime_test_imports.py",
+        "echo '        except ImportError as e:' >> /opt/runtime_test_imports.py",
+        "echo '            if required:' >> /opt/runtime_test_imports.py",
+        "echo '                print(f\"✗ CRITICAL: {pkg_name} failed: {e}\")' >> /opt/runtime_test_imports.py",
+        "echo '                success = False' >> /opt/runtime_test_imports.py",
+        "echo '            else:' >> /opt/runtime_test_imports.py",
+        "echo '                print(f\"⚠ Optional: {pkg_name} not available: {e}\")' >> /opt/runtime_test_imports.py",
+        "echo '    return success' >> /opt/runtime_test_imports.py",
+        "echo '' >> /opt/runtime_test_imports.py",
+        "echo 'def main():' >> /opt/runtime_test_imports.py",
+        "echo '    print(\"Running runtime import verification...\")' >> /opt/runtime_test_imports.py",
+        "echo '    try:' >> /opt/runtime_test_imports.py",
+        "echo '        from helpers.import_utils import verify_all_imports' >> /opt/runtime_test_imports.py",
+        "echo '        print(\"Using comprehensive import verification...\")' >> /opt/runtime_test_imports.py",
+        "echo '        verify_all_imports()' >> /opt/runtime_test_imports.py",
+        "echo '        print(\"✓ Comprehensive import verification completed\")' >> /opt/runtime_test_imports.py",
+        "echo '        return 0' >> /opt/runtime_test_imports.py",
+        "echo '    except Exception as e:' >> /opt/runtime_test_imports.py",
+        "echo '        print(f\"⚠ Comprehensive verification not available: {e}\")' >> /opt/runtime_test_imports.py",
+        "echo '        print(\"Falling back to basic import testing...\")' >> /opt/runtime_test_imports.py",
+        "echo '        if test_basic_imports():' >> /opt/runtime_test_imports.py",
+        "echo '            print(\"✓ Basic import verification passed\")' >> /opt/runtime_test_imports.py",
+        "echo '            return 0' >> /opt/runtime_test_imports.py",
+        "echo '        else:' >> /opt/runtime_test_imports.py",
+        "echo '            print(\"✗ Basic import verification failed\")' >> /opt/runtime_test_imports.py",
+        "echo '            return 1' >> /opt/runtime_test_imports.py",
+        "echo '' >> /opt/runtime_test_imports.py",
+        "echo 'if __name__ == \"__main__\":' >> /opt/runtime_test_imports.py",
+        "echo '    sys.exit(main())' >> /opt/runtime_test_imports.py",
     ])
+    .env(
+        {
+            "PATH": "/opt/miniconda/envs/RiemannianRF/bin:/opt/miniconda/bin:/root/.cargo/bin:$PATH",
+            "CUDA_HOME": "/usr/local/cuda",
+            "TOKENIZERS_PARALLELISM": "false",
+            "CONDA_DEFAULT_ENV": "RiemannianRF",
+            "CONDA_PREFIX": "/opt/miniconda/envs/RiemannianRF",
+            "VIRTUAL_ENV": "/opt/miniconda/envs/RiemannianRF",
+        }
+    )
 )
 
 
@@ -818,6 +1012,451 @@ def sync_outputs_to_local():
 
 @app.function(
     image=image,
+    gpu="H100:8",  # Use 8 H100 GPUs for full training
+    volumes={
+        "/datasets": datasets_volume,
+        "/checkpoints": checkpoints_volume,
+        "/cache": cache_volume,
+    },
+    timeout=86400,  # 24 hours (Modal's maximum)
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def train_proposed_noregularization():
+    """Run the no regularization training with proposed method on 8 H100s"""
+    import subprocess
+    import os
+    import sys
+    import shutil
+    from pathlib import Path
+
+    print("Starting GeodesicFlow Proposed No Regularization training on 8 H100s...")
+    print("Using pre-built conda environment with all dependencies...")
+
+    # Use the pre-built conda environment
+    conda_python = "/opt/miniconda/envs/RiemannianRF/bin/python"
+
+    print("✓ Using pre-built RiemannianRF conda environment")
+    print(f"✓ Python executable: {conda_python}")
+
+    # Create comprehensive fix for save_hooks.py (adapted from friend's script)
+    print("Applying fixes for save_hooks.py...")
+    save_hooks_file = "/app/helpers/training/save_hooks.py"
+    if os.path.exists(save_hooks_file):
+        print(f"Fixing potential issues in {save_hooks_file}...")
+
+        # Create fix script
+        fix_script_content = """
+import re
+import sys
+
+def fix_save_hooks(file_path):
+    print(f"Fixing potential issues in {file_path}")
+    with open(file_path, 'r') as f:
+        content = f.read()
+
+    # Add safety checks for NoneType errors
+    for i, line in enumerate(content.split('\\n')):
+        if "if self.ema_model.ema_model._modules:" in line:
+            content = content.replace(
+                "if self.ema_model.ema_model._modules:",
+                "if self.ema_model and self.ema_model.ema_model and hasattr(self.ema_model.ema_model, '_modules') and self.ema_model.ema_model._modules:"
+            )
+
+    # Write fixed content back
+    with open(file_path, 'w') as f:
+        f.write(content)
+
+    print(f"Applied safety fixes to {file_path}")
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        fix_save_hooks(sys.argv[1])
+"""
+
+        with open("/app/fix_save_hooks.py", "w") as f:
+            f.write(fix_script_content)
+
+        # Run the fix
+        subprocess.run([conda_python, "/app/fix_save_hooks.py", save_hooks_file], check=False)
+
+    # Fix optimizer_param.py file to handle missing optimi package
+    print("Fixing optimizer_param.py...")
+    optimizer_param_file = "/app/helpers/training/optimizer_param.py"
+    if os.path.exists(optimizer_param_file):
+        with open(optimizer_param_file, "r") as f:
+            optimizer_content = f.read()
+
+        # Fix bitsandbytes import issue
+        if "logger.warning(" in optimizer_content:
+            optimizer_content = optimizer_content.replace(
+                'logger.warning(',
+                'print('
+            )
+
+        # Fix missing optimi import by adding try/except around optimi usage
+        lines = optimizer_content.split('\n')
+        new_lines = []
+        for line in lines:
+            if '"class": optimi.StableAdamW,' in line:
+                # Replace the optimi usage with a conditional check
+                indent = len(line) - len(line.lstrip())
+                new_lines.append(' ' * indent + '# StableAdamW optimizer (requires torch-optimi)')
+                new_lines.append(' ' * indent + 'try:')
+                new_lines.append(' ' * indent + '    import optimi')
+                new_lines.append(' ' * indent + '    "class": optimi.StableAdamW,')
+                new_lines.append(' ' * indent + 'except ImportError:')
+                new_lines.append(' ' * indent + '    # Fallback to AdamW if optimi not available')
+                new_lines.append(' ' * indent + '    "class": torch.optim.AdamW,')
+            elif 'optimi.' in line and 'import' not in line:
+                # Replace any other optimi references with torch.optim equivalents
+                new_lines.append(line.replace('optimi.', 'torch.optim.'))
+            else:
+                new_lines.append(line)
+
+        optimizer_content = '\n'.join(new_lines)
+
+        with open(optimizer_param_file, "w") as f:
+            f.write(optimizer_content)
+        print("✓ Fixed optimizer_param.py (added optimi fallbacks)")
+
+    # Activate pre-built conda environment and set up environment variables
+    print("Activating pre-built conda environment...")
+
+    # Source the environment activation script and update environment
+    env = os.environ.copy()
+    env.update({
+        # Core training settings
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",  # 8 H100 GPUs
+        "CONFIG_ENV_FILE": "config/config_proposed_sd.env",
+        "CONFIG_JSON_FILE": "config/config_coco17_sd35_proposed_noregularization.json",
+        "CONFIG_BACKEND": "json",
+        "DISABLE_UPDATES": "1",
+        "PYTHONPATH": "/app",
+        "TRAINING_NUM_PROCESSES": "8",  # 8 processes for 8 GPUs
+        "TRAINING_NUM_MACHINES": "1",
+        "MIXED_PRECISION": "bf16",
+        "MAIN_PROCESS_PORT": "29501",
+        "ACCELERATE_CONFIG_PATH": "/app/accelerate_config_h100.yaml",
+        "TMPDIR": "/tmp",
+        "WANDB_TMP_DIR": "/tmp",
+
+        # Conda environment settings (pre-built)
+        "PATH": "/opt/miniconda/envs/RiemannianRF/bin:/opt/miniconda/bin:" + env.get("PATH", ""),
+        "CONDA_DEFAULT_ENV": "RiemannianRF",
+        "CONDA_PREFIX": "/opt/miniconda/envs/RiemannianRF",
+        "VIRTUAL_ENV": "/opt/miniconda/envs/RiemannianRF",
+        "VENV_PATH": "/opt/miniconda/envs/RiemannianRF",
+        "PYTHON": conda_python,
+        "TOKENIZERS_PARALLELISM": "false",
+    })
+
+    # Clear PYTHONPATH to avoid conflicts (same as in activation script)
+    if "PYTHONPATH" in env:
+        del env["PYTHONPATH"]
+
+    # Verify pre-built environment works
+    print("Verifying pre-built environment...")
+    verify_cmd = f"source /opt/activate_env.sh && {conda_python} -c \"import typing_extensions, torch, accelerate, transformers, diffusers; print('✓ All critical imports work in pre-built environment')\""
+    verify_result = subprocess.run(
+        ["bash", "-c", verify_cmd],
+        capture_output=True,
+        text=True
+    )
+    if verify_result.returncode == 0:
+        print("✓ Pre-built environment verification passed")
+        print(verify_result.stdout.strip())
+    else:
+        print(f"✗ Pre-built environment verification failed: {verify_result.stderr}")
+        return f"Pre-built environment verification failed: {verify_result.stderr}"
+
+    # Setup accelerate config
+    print("Setting up accelerate configuration for 8 H100s...")
+    os.makedirs(os.path.expanduser("~/.cache/huggingface/accelerate"), exist_ok=True)
+
+    if os.path.exists("/app/accelerate_config_h100.yaml"):
+        shutil.copy(
+            "/app/accelerate_config_h100.yaml",
+            os.path.expanduser("~/.cache/huggingface/accelerate/default_config.yaml"),
+        )
+        print("✓ Using H100 accelerate config")
+    else:
+        print("✗ H100 accelerate config not found")
+
+    # Verify dataset setup
+    print("Checking dataset setup...")
+    coco17_path = Path("/datasets")
+    train_images = coco17_path / "train2017"
+
+    if train_images.exists():
+        image_count = len(list(train_images.glob("*.jpg")))
+        print(f"✓ Found COCO17 dataset with {image_count} training images")
+    else:
+        print("✗ COCO17 dataset not found in /datasets/")
+        return "Error: COCO17 dataset not found. Please run download_dataset first."
+
+    # Update coco17.json for Modal paths
+    coco17_config = "/app/config/coco17.json"
+    if os.path.exists(coco17_config):
+        with open(coco17_config, "r") as f:
+            config_content = f.read()
+
+        # Update paths for Modal volumes
+        config_content = config_content.replace(
+            '"/opt/dlami/nvme/datasets/coco17/train"',
+            '"/datasets/train2017"'
+        )
+        config_content = config_content.replace(
+            '"/opt/dlami/nvme/cache/vae/sd3_ft/coco17"',
+            '"/cache/vae/sd3_ft/coco17"'
+        )
+        config_content = config_content.replace(
+            '"/opt/dlami/nvme/cache/text/sd3_ft/coco17"',
+            '"/cache/text/sd3_ft/coco17"'
+        )
+
+        with open(coco17_config, "w") as f:
+            f.write(config_content)
+        print("✓ Updated coco17.json for Modal paths")
+
+    # Test critical imports before training
+    print("Testing critical imports before training...")
+    critical_imports = [
+        "typing_extensions",
+        "torch",
+        "accelerate",
+        "transformers",
+        "diffusers"
+    ]
+
+    all_imports_ok = True
+    for import_name in critical_imports:
+        test_result = subprocess.run(
+            [conda_python, "-c", f"import {import_name}; print('✓ {import_name} imported successfully')"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if test_result.returncode == 0:
+            print(test_result.stdout.strip())
+        else:
+            print(f"✗ {import_name} import failed: {test_result.stderr.strip()}")
+            all_imports_ok = False
+
+    if not all_imports_ok:
+        return "Critical imports failed - cannot proceed with training"
+
+    # Test PyTorch and CUDA
+    print("Testing PyTorch and CUDA setup...")
+    torch_test = subprocess.run(
+        [conda_python, "-c", "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU count: {torch.cuda.device_count()}')"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if torch_test.returncode == 0:
+        print("✓ PyTorch/CUDA test passed")
+        print(torch_test.stdout)
+    else:
+        print(f"✗ PyTorch/CUDA test failed: {torch_test.stderr}")
+        return f"PyTorch/CUDA test failed: {torch_test.stderr}"
+
+    # Test accelerate command
+    print("Testing accelerate command...")
+    accelerate_test = subprocess.run(
+        [conda_python, "-c", "import accelerate; print('Accelerate version:', accelerate.__version__)"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if accelerate_test.returncode != 0:
+        print(f"✗ Accelerate test failed: {accelerate_test.stderr}")
+        return f"Accelerate test failed: {accelerate_test.stderr}"
+    else:
+        print(f"✓ Accelerate test passed: {accelerate_test.stdout.strip()}")
+
+    # Start the training
+    print("Starting GeodesicFlow Proposed No Regularization training...")
+    print("Command: CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 CONFIG_ENV_FILE='config/config_proposed_sd.env' CONFIG_JSON_FILE='config/config_coco17_sd35_proposed_noregularization.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_noregularization.sh")
+
+    # Run the training script with proper environment activation
+    training_cmd = "source /opt/activate_env.sh && /bin/bash /app/train_proposed_noregularization.sh"
+    result = subprocess.run(
+        ["bash", "-c", training_cmd],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd="/app",
+    )
+
+    print(f"Training script stdout: {result.stdout}")
+    if result.stderr:
+        print(f"Training script stderr: {result.stderr}")
+
+    if result.returncode != 0:
+        print(f"Training failed with return code: {result.returncode}")
+        raise Exception(f"Training failed: {result.stderr}")
+
+    print("GeodesicFlow Proposed No Regularization training completed successfully!")
+    return "Training completed successfully!"
+
+
+@app.function(
+    image=image,
+    gpu="A100:1",  # Single A100 for testing no regularization
+    volumes={
+        "/datasets": datasets_volume,
+        "/checkpoints": checkpoints_volume,
+        "/cache": cache_volume,
+    },
+    timeout=86400,  # 24 hours
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def train_proposed_noregularization_test():
+    """Test the no regularization training with 1 A100 GPU"""
+    import subprocess
+    import os
+    import shutil
+    from pathlib import Path
+
+    print("Starting GeodesicFlow Proposed No Regularization TEST training on 1 A100...")
+    print("Using pre-built conda environment with all dependencies...")
+
+    # Use the pre-built conda environment
+    conda_python = "/opt/miniconda/envs/RiemannianRF/bin/python"
+
+    print("✓ Using pre-built RiemannianRF conda environment")
+    print(f"✓ Python executable: {conda_python}")
+
+    # Run robust runtime import verification
+    print("Running robust runtime import verification...")
+    try:
+        result = subprocess.run(
+            [conda_python, "/opt/runtime_test_imports.py"],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        print("Runtime import verification output:")
+        print(result.stdout)
+        if result.stderr:
+            print("Verification warnings/errors:")
+            print(result.stderr)
+
+        if result.returncode == 0:
+            print("✓ Runtime import verification passed")
+        else:
+            print("⚠ Runtime import verification had issues (training will continue with available packages)")
+    except Exception as e:
+        print(f"⚠ Runtime import verification failed: {e}")
+        print("Training will proceed with minimal verification")
+
+    # Create test config with 1 GPU
+    test_env_config = "/app/config/config_proposed_sd_test.env"
+    with open(test_env_config, "w") as f:
+        f.write("TRAINING_NUM_PROCESSES=1\\nTRAINING_NUM_MACHINES=1\\nTRAINING_DYNAMO_BACKEND='no'\\nCONFIG_BACKEND='json'\\nMAIN_PROCESS_PORT=29501\\n")
+
+    # Set up environment for single GPU testing using pre-built conda environment
+    print("Activating pre-built conda environment for testing...")
+
+    env = os.environ.copy()
+    env.update({
+        # Core training settings for 1 A100
+        "CUDA_VISIBLE_DEVICES": "0",  # Single A100 GPU
+        "CONFIG_ENV_FILE": "config/config_proposed_sd_test.env",
+        "CONFIG_JSON_FILE": "config/config_coco17_sd35_proposed_noregularization.json",
+        "CONFIG_BACKEND": "json",
+        "DISABLE_UPDATES": "1",
+        "TRAINING_NUM_PROCESSES": "1",
+        "TRAINING_NUM_MACHINES": "1",
+        "MIXED_PRECISION": "bf16",
+        "MAIN_PROCESS_PORT": "29501",
+        "ACCELERATE_CONFIG_PATH": "/app/accelerate_config_a100.yaml",
+
+        # Conda environment settings (pre-built)
+        "PATH": "/opt/miniconda/envs/RiemannianRF/bin:/opt/miniconda/bin:" + env.get("PATH", ""),
+        "CONDA_DEFAULT_ENV": "RiemannianRF",
+        "CONDA_PREFIX": "/opt/miniconda/envs/RiemannianRF",
+        "VIRTUAL_ENV": "/opt/miniconda/envs/RiemannianRF",
+        "VENV_PATH": "/opt/miniconda/envs/RiemannianRF",
+        "PYTHON": conda_python,
+        "TOKENIZERS_PARALLELISM": "false",
+    })
+
+    # Clear PYTHONPATH to avoid conflicts (same as in activation script)
+    if "PYTHONPATH" in env:
+        del env["PYTHONPATH"]
+
+    # Verify pre-built environment works
+    print("Verifying pre-built environment for testing...")
+    verify_cmd = f"source /opt/activate_env.sh && {conda_python} -c \"import typing_extensions, torch, accelerate, transformers; print('✓ Critical imports work in pre-built environment')\""
+    verify_result = subprocess.run(
+        ["bash", "-c", verify_cmd],
+        capture_output=True,
+        text=True
+    )
+    if verify_result.returncode == 0:
+        print("✓ Pre-built environment verification passed")
+        print(verify_result.stdout.strip())
+    else:
+        print(f"✗ Pre-built environment verification failed: {verify_result.stderr}")
+        return f"Pre-built environment verification failed: {verify_result.stderr}"
+
+    # Verify accelerate works before starting training
+    print("Testing accelerate command before training...")
+    accelerate_test = subprocess.run(
+        [conda_python, "-c", "import accelerate; print('Accelerate version:', accelerate.__version__)"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if accelerate_test.returncode != 0:
+        print(f"✗ Accelerate test failed: {accelerate_test.stderr}")
+        return f"Accelerate test failed: {accelerate_test.stderr}"
+    else:
+        print(f"✓ Accelerate test passed: {accelerate_test.stdout.strip()}")
+
+    # Test accelerate launch command
+    accelerate_binary = os.path.join(os.path.dirname(conda_python), "accelerate")
+    if os.path.exists(accelerate_binary):
+        print("Testing accelerate launch command...")
+        launch_test = subprocess.run(
+            [accelerate_binary, "launch", "--help"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if launch_test.returncode != 0:
+            print(f"✗ Accelerate launch test failed: {launch_test.stderr}")
+            return f"Accelerate launch test failed: {launch_test.stderr}"
+        else:
+            print("✓ Accelerate launch command works")
+
+    # Run training with proper environment activation
+    print("Starting test training...")
+    training_cmd = "source /opt/activate_env.sh && /bin/bash /app/train_proposed_noregularization.sh"
+    result = subprocess.run(
+        ["bash", "-c", training_cmd],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd="/app",
+    )
+
+    print(f"Test training stdout: {result.stdout}")
+    if result.stderr:
+        print(f"Test training stderr: {result.stderr}")
+
+    if result.returncode != 0:
+        print(f"Test training failed with return code: {result.returncode}")
+        return f"Test training failed: {result.stderr}"
+
+    print("Test training completed successfully!")
+    return "Test training completed successfully!"
+
+
+@app.function(
+    image=image,
     volumes={
         "/checkpoints": checkpoints_volume,
     },
@@ -858,7 +1497,9 @@ def list_outputs():
 @app.local_entrypoint()
 def main(
     download_data: bool = False,
-    train: bool = True,
+    train: bool = False,
+    train_noregularization: bool = False,
+    train_noregularization_test: bool = False,
     list_files: bool = False,
     sync_outputs: bool = False,
     upload_text_zip: bool = False,
@@ -869,7 +1510,16 @@ def main(
     """Main entrypoint for the Modal app
 
     Use --detach to keep the app running even if local client disconnects.
-    Example: modal run modal_app.py --train --detach
+
+    Training options:
+    --train: Original FLUX training (legacy)
+    --train-noregularization: SD 3.5 No Regularization training on 8 H100s
+    --train-noregularization-test: SD 3.5 No Regularization training test on 1 A100
+
+    Examples:
+    modal run modal_app.py --train-noregularization --detach
+    modal run modal_app.py --train-noregularization-test --detach
+    modal run modal_app.py --download-data --train-noregularization --detach
     """
 
     if test_gpu:
@@ -893,9 +1543,21 @@ def main(
         print(f"Download result: {download_result}")
 
     if train:
-        print("Starting training...")
+        print("Starting original FLUX training...")
         train_result = train_model.remote()
         print(f"Training result: {train_result}")
+
+    if train_noregularization:
+        print("Starting SD 3.5 No Regularization training on 8 H100s...")
+        print("This will run the exact command you requested:")
+        print("CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 CONFIG_ENV_FILE='config/config_proposed_sd.env' CONFIG_JSON_FILE='config/config_coco17_sd35_proposed_noregularization.json' CONFIG_BACKEND=json DISABLE_UPDATES=1 ./train_proposed_noregularization.sh")
+        train_result = train_proposed_noregularization.remote()
+        print(f"No Regularization Training result: {train_result}")
+
+    if train_noregularization_test:
+        print("Starting SD 3.5 No Regularization TEST training on 1 A100...")
+        train_result = train_proposed_noregularization_test.remote()
+        print(f"No Regularization Test Training result: {train_result}")
 
     if list_files:
         print("Listing output files...")

@@ -13,36 +13,66 @@ except:
     pass
 
 try:
-    from torchao.prototype.low_bit_optim import (
-        AdamW8bit as AOAdamW8Bit,
-        AdamW4bit as AOAdamW4Bit,
-        AdamFp8 as AOAdamFp8,
-        AdamWFp8 as AOAdamWFp8,
-        CPUOffloadOptimizer as AOCPUOffloadOptimizer,
-    )
-    torchao_available = True
+    from helpers.import_utils import importer
+    torchao = importer.safe_import("torchao", "torchao not available, low-precision optimizers will be disabled")
+    if torchao:
+        from torchao.prototype.low_bit_optim import (
+            AdamW8bit as AOAdamW8Bit,
+            AdamW4bit as AOAdamW4Bit,
+            AdamFp8 as AOAdamFp8,
+            AdamWFp8 as AOAdamWFp8,
+            CPUOffloadOptimizer as AOCPUOffloadOptimizer,
+        )
+        torchao_available = True
 
-    if torch.backends.mps.is_available():
-        import torch._dynamo
+        if torch.backends.mps.is_available():
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
+    else:
+        # torchao not available, set to None
+        AOAdamW8Bit = None
+        AOAdamW4Bit = None
+        AOAdamFp8 = None
+        AOAdamWFp8 = None
+        AOCPUOffloadOptimizer = None
+        torchao_available = False
+except ImportError:
+    # Fallback to direct import if import_utils not available
+    try:
+        from torchao.prototype.low_bit_optim import (
+            AdamW8bit as AOAdamW8Bit,
+            AdamW4bit as AOAdamW4Bit,
+            AdamFp8 as AOAdamFp8,
+            AdamWFp8 as AOAdamWFp8,
+            CPUOffloadOptimizer as AOCPUOffloadOptimizer,
+        )
+        torchao_available = True
 
-        torch._dynamo.config.suppress_errors = True
-except Exception as e:
-    print(f"Warning: torchao low-precision optimizers not available: {e}")
-    # Define dummy classes as fallbacks
-    AOAdamW8Bit = None
-    AOAdamW4Bit = None
-    AOAdamFp8 = None
-    AOAdamWFp8 = None
-    AOCPUOffloadOptimizer = None
-    torchao_available = False
+        if torch.backends.mps.is_available():
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
+    except Exception as e:
+        print(f"Warning: torchao low-precision optimizers not available: {e}")
+        # Define dummy classes as fallbacks
+        AOAdamW8Bit = None
+        AOAdamW4Bit = None
+        AOAdamFp8 = None
+        AOAdamWFp8 = None
+        AOCPUOffloadOptimizer = None
+        torchao_available = False
 
 try:
-    import optimi
-
-    is_optimi_available = True
-except:
-    print("Warning: Could not load optimi library. Please install `torch-optimi` for better memory efficiency.")
-    is_optimi_available = False
+    from helpers.import_utils import importer
+    optimi = importer.safe_import("optimi", "torch-optimi not available, optimi-based optimizers will be disabled")
+    is_optimi_available = optimi is not None
+except ImportError:
+    # Fallback to direct import if import_utils not available
+    try:
+        import optimi
+        is_optimi_available = True
+    except ImportError:
+        print("Warning: Could not load optimi library. Please install `torch-optimi` for better memory efficiency.")
+        is_optimi_available = False
 
 is_bitsandbytes_available = False
 try:
@@ -137,114 +167,6 @@ optimizer_choices = {
         },
         "class": AdamWScheduleFreeKahan,
     },
-    "optimi-stableadamw": {
-        "precision": "any",
-        "default_settings": {
-            "betas": (0.9, 0.99),
-            "weight_decay": 1e-2,
-            "eps": 1e-6,
-            "decouple_lr": False,
-            "max_lr": None,
-            "kahan_sum": True,
-            "foreach": True,
-        },
-        "class": optimi.StableAdamW,
-    },
-    "optimi-adamw": {
-        "precision": "any",
-        "default_settings": {
-            "betas": (0.9, 0.99),
-            "eps": 1e-6,
-            "weight_decay": 0.0,
-            "decouple_lr": False,
-            "kahan_sum": True,
-            "max_lr": None,
-        },
-        "class": optimi.AdamW,
-    },
-    "optimi-lion": {
-        "precision": "any",
-        "default_settings": {
-            "betas": (0.9, 0.99),
-            "weight_decay": 0.0,
-            "decouple_lr": False,
-            "max_lr": None,
-            "kahan_sum": True,
-            "foreach": True,
-        },
-        "class": optimi.Lion,
-    },
-    "optimi-radam": {
-        "precision": "any",
-        "default_settings": {
-            "betas": (0.9, 0.99),
-            "weight_decay": 0.0,
-            "eps": 1e-6,
-            "decouple_wd": True,
-            "decouple_lr": False,
-            "kahan_sum": True,
-            "foreach": True,
-        },
-        "class": optimi.RAdam,
-    },
-    "optimi-ranger": {
-        "precision": "any",
-        "default_settings": {
-            "betas": (0.9, 0.99),
-            "weight_decay": 0.0,
-            "eps": 1e-6,
-            "k": 6,
-            "alpha": 0.5,
-            "decouple_wd": True,
-            "decouple_lr": False,
-            "max_lr": None,
-            "kahan_sum": True,
-            "foreach": True,
-        },
-        "class": optimi.Ranger,
-    },
-    "optimi-adan": {
-        "precision": "any",
-        "default_settings": {
-            "betas": (0.98, 0.92, 0.999),
-            "weight_decay": 2e-2,
-            "eps": 1e-6,
-            "decouple_lr": False,
-            "max_lr": None,
-            "adam_wd": False,
-            "kahan_sum": True,
-            "foreach": True,
-        },
-        "class": optimi.Adan,
-    },
-    "optimi-adam": {
-        "precision": "any",
-        "default_settings": {
-            "betas": (0.9, 0.99),
-            "eps": 1e-6,
-            "weight_decay": 0.0,
-            "decouple_wd": False,
-            "decouple_lr": False,
-            "kahan_sum": True,
-            "max_lr": None,
-        },
-        "class": optimi.Adam,
-    },
-    "optimi-sgd": {
-        "precision": "any",
-        "default_settings": {
-            "momentum": 0,
-            "weight_decay": 0.0,
-            "dampening": False,
-            "decouple_wd": False,
-            "decouple_lr": False,
-            "max_lr": None,
-            "torch_init": False,
-            "kahan_sum": True,
-            "foreach": True,
-        },
-        "class": optimi.SGD,
-    },
     "soap": {
         "precision": "any",
         "default_settings": {
@@ -263,6 +185,120 @@ optimizer_choices = {
         "class": SOAP,
     },
 }
+
+if is_optimi_available:
+    optimizer_choices.update(
+        {
+            "optimi-stableadamw": {
+                "precision": "any",
+                "default_settings": {
+                    "betas": (0.9, 0.99),
+                    "weight_decay": 1e-2,
+                    "eps": 1e-6,
+                    "decouple_lr": False,
+                    "max_lr": None,
+                    "kahan_sum": True,
+                    "foreach": True,
+                },
+                "class": optimi.StableAdamW,
+            },
+            "optimi-adamw": {
+                "precision": "any",
+                "default_settings": {
+                    "betas": (0.9, 0.99),
+                    "eps": 1e-6,
+                    "weight_decay": 0.0,
+                    "decouple_lr": False,
+                    "kahan_sum": True,
+                    "max_lr": None,
+                },
+                "class": optimi.AdamW,
+            },
+            "optimi-lion": {
+                "precision": "any",
+                "default_settings": {
+                    "betas": (0.9, 0.99),
+                    "weight_decay": 0.0,
+                    "decouple_lr": False,
+                    "max_lr": None,
+                    "kahan_sum": True,
+                    "foreach": True,
+                },
+                "class": optimi.Lion,
+            },
+            "optimi-radam": {
+                "precision": "any",
+                "default_settings": {
+                    "betas": (0.9, 0.99),
+                    "weight_decay": 0.0,
+                    "eps": 1e-6,
+                    "decouple_wd": True,
+                    "decouple_lr": False,
+                    "kahan_sum": True,
+                    "foreach": True,
+                },
+                "class": optimi.RAdam,
+            },
+            "optimi-ranger": {
+                "precision": "any",
+                "default_settings": {
+                    "betas": (0.9, 0.99),
+                    "weight_decay": 0.0,
+                    "eps": 1e-6,
+                    "k": 6,
+                    "alpha": 0.5,
+                    "decouple_wd": True,
+                    "decouple_lr": False,
+                    "max_lr": None,
+                    "kahan_sum": True,
+                    "foreach": True,
+                },
+                "class": optimi.Ranger,
+            },
+            "optimi-adan": {
+                "precision": "any",
+                "default_settings": {
+                    "betas": (0.98, 0.92, 0.999),
+                    "weight_decay": 2e-2,
+                    "eps": 1e-6,
+                    "decouple_lr": False,
+                    "max_lr": None,
+                    "adam_wd": False,
+                    "kahan_sum": True,
+                    "foreach": True,
+                },
+                "class": optimi.Adan,
+            },
+            "optimi-adam": {
+                "precision": "any",
+                "default_settings": {
+                    "betas": (0.9, 0.99),
+                    "eps": 1e-6,
+                    "weight_decay": 0.0,
+                    "decouple_wd": False,
+                    "decouple_lr": False,
+                    "kahan_sum": True,
+                    "max_lr": None,
+                },
+                "class": optimi.Adam,
+            },
+            "optimi-sgd": {
+                "precision": "any",
+                "default_settings": {
+                    "momentum": 0,
+                    "weight_decay": 0.0,
+                    "dampening": False,
+                    "decouple_wd": False,
+                    "decouple_lr": False,
+                    "max_lr": None,
+                    "torch_init": False,
+                    "kahan_sum": True,
+                    "foreach": True,
+                },
+                "class": optimi.SGD,
+            },
+        }
+    )
 
 if is_bitsandbytes_available:
     optimizer_choices.update(
